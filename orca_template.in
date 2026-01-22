@@ -1,0 +1,18 @@
+# Optimize structure with constraints using M06L functional with basis set def2-TZVP and tight SCF settings
+! COPT M06L def2-TZVP TightSCF
+
+# Do a frequency calculation (and produce hessian in .hess file)
+! AnFreq
+
+# Specify numnber of processors
+%pal nprocs 16
+     end
+
+# Constrain Calpha atoms
+%geom Constraints
+        {C [CA_ATOM] C}  # Freeze all coordinates (X, Y, Z) of atom [CA_ATOM]
+        end
+      end
+
+# Use xyz file as input, first number is the charge of the system, and the second number is the multiplicity (2S+1).
+*xyzfile [CHARGE] [MULTIPLICITY] [ID_DIR]/[PDB_ID]_clean.xyz

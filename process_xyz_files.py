@@ -14,10 +14,10 @@ from pathlib import Path
 def get_charge_multiplicity(cys, his):
     """Get charge and multiplicity based on cysteine and histidine counts."""
     lookup = {
-        (4, 0): (-2, 2),
+        (4, 0): (-2, 1),  # (cys, his) : (charge, mult)
         (3, 1): (-1, 2),
         (2, 2): (0, 1),
-        (1, 3): (1, 1),
+        (1, 3): (1, 2),
         (0, 4): (2, 1),
     }
     return lookup.get((cys, his), (None, None))
@@ -43,7 +43,7 @@ def extract_ca_atoms(comments_file):
     return ca_atoms
 
 
-def process_xyz_file(xyz_file, cys, his, template_dir, output_root):
+def process_xyz_file(xyz_file, cys, his, template_dir, output_root, dry_run):
     """Process a single XYZ file."""
     # Extract ID from filename
     filename = os.path.basename(xyz_file)
@@ -60,6 +60,7 @@ def process_xyz_file(xyz_file, cys, his, template_dir, output_root):
     # Copy XYZ file to the directory (leave original in place)
     dest_xyz = id_dir / filename
     shutil.copy2(xyz_file, dest_xyz)
+    os.chmod(dest_xyz, 0o644)
     print(f"  Copied {filename} to {id_dir}/")
     
     # Run xyz_clean_and_comments.py on the XYZ file
@@ -125,9 +126,14 @@ def process_xyz_file(xyz_file, cys, his, template_dir, output_root):
         print("  Warning: No [CA_ATOM] placeholder found in template")
         print(f"  Found {len(ca_constraints)} CA atoms to constrain")
     
+    # Ensure final newline (some ORCA versions can misread the last line without it)
+    if not template_content.endswith("\n"):
+        template_content += "\n"
+
     # Write modified template
     with open(output_file, 'w') as f:
         f.write(template_content)
+    os.chmod(output_file, 0o644)
     print(f"  Created input file: {output_file}")
     print(f"    CHARGE={charge}, MULTIPLICITY={multiplicity}")
     print(f"    CA atoms to freeze: {len(ca_atoms)}")
@@ -140,17 +146,23 @@ def process_xyz_file(xyz_file, cys, his, template_dir, output_root):
         os.chmod(dest_script, 0o755)
         print(f"  Copied run_job.sh to {id_dir}/")
         
-        # Run dry-run
-        print(f"  Running dry-run...")
+        # Run job (optionally dry-run)
+        run_args = ["./run_job.sh"]
+        if dry_run:
+            run_args.append("--dry-run")
+        run_args.append(f"{id_name}.in")
+
+        run_label = "dry-run" if dry_run else "run"
+        print(f"  Running {run_label}...")
         result = subprocess.run(
-            ["./run_job.sh", "--dry-run", f"{id_name}.in"],
+            run_args,
             cwd=id_dir,
             capture_output=True,
             text=True
         )
-        print(f"  Dry-run output:\n{result.stdout}")
+        print(f"  {run_label.capitalize()} output:\n{result.stdout}")
         if result.stderr:
-            print(f"  Dry-run stderr:\n{result.stderr}")
+            print(f"  {run_label.capitalize()} stderr:\n{result.stderr}")
     else:
         print(f"  Warning: run_job.sh not found at {run_script}")
 
@@ -159,10 +171,11 @@ def main():
     parser = argparse.ArgumentParser(
         description='Process XYZ files for ORCA calculations with specified ligand composition.'
     )
-    parser.add_argument('directory', type=str, help='Directory containing XYZ files')
+    parser.add_argument('path', type=str, help='Directory containing XYZ files or a single XYZ file')
     parser.add_argument('--cys', type=int, required=True, help='Number of cysteines')
     parser.add_argument('--his', type=int, required=True, help='Number of histidines')
     parser.add_argument('--out-dir', type=str, default=None, help='Output directory for ID folders')
+    parser.add_argument('-n', '--dry-run', action='store_true', help='Run run_job.sh with --dry-run')
     
     args = parser.parse_args()
     
@@ -189,22 +202,28 @@ def main():
     output_root.mkdir(parents=True, exist_ok=True)
 
     # Find all XYZ files in the specified directory
-    target_dir = Path(args.directory)
-    if not target_dir.exists():
-        print(f"ERROR: Directory not found: {target_dir}")
+    target_path = Path(args.path)
+    if not target_path.exists():
+        print(f"ERROR: Path not found: {target_path}")
         sys.exit(1)
-    
-    xyz_files = list(target_dir.glob("*.xyz"))
-    
-    if not xyz_files:
-        print(f"No XYZ files found in {target_dir}")
-        sys.exit(0)
+
+    if target_path.is_file():
+        if target_path.suffix.lower() != ".xyz":
+            print(f"ERROR: File is not an XYZ file: {target_path}")
+            sys.exit(1)
+        xyz_files = [target_path]
+    else:
+        xyz_files = list(target_path.glob("*.xyz"))
+
+        if not xyz_files:
+            print(f"No XYZ files found in {target_path}")
+            sys.exit(0)
     
     print(f"\nFound {len(xyz_files)} XYZ file(s) to process")
     print(f"Output root: {output_root}")
     
     for xyz_file in xyz_files:
-        process_xyz_file(xyz_file, args.cys, args.his, template_dir, output_root)
+        process_xyz_file(xyz_file, args.cys, args.his, template_dir, output_root, args.dry_run)
     
     print("\nProcessing complete!")
 

@@ -1,5 +1,7 @@
 # Optimize structure with constraints using M06L functional with basis set def2-TZVP and tight SCF settings
-! COPT M06L def2-TZVP TightSCF
+! COPT B97-3c 
+# ! COPT B97-3c CPCM(water)
+# ! COPT M06L def2-TZVP TightSCF
 
 # Do a frequency calculation (and produce hessian in .hess file)
 ! AnFreq

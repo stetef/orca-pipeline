@@ -1,0 +1,56 @@
+# Set target to feffXANES (we will later change this to XANES).
+target_list { cfavg }
+cfavg_target{ xas }
+#loop_parameter{ 
+feff.debye{10.0   315.0  5 corvus-[ID].dym  16  0  3}
+#}
+#10 200 0
+#10 300 0
+#write_input_only{ True }
+#usesaved{ True }
+
+# Make Corvus use FEFF for XANES.
+absorbing_atom_type{ Zn }
+#cif_input{corvus.cif}
+xyz_input{[DIRECTORY][ID].xyz}
+#
+#mt_overlap{ 
+#H 1.0
+#}
+#atomic_charge{
+#N 0.25
+#Zn 1.0
+#}
+feff.equivalence{ 4 }
+feff.edge{K}
+feff.chsh{4}
+feff.equivalence_nmax{5}
+feff.scf{ 9.0 0 100 0.05 0}
+feff.scframp{ 3.0 1 }
+feff.control{1 1 1 1 1 1}
+#feff.ldos{-20 20 0.25 200}
+#feff.corrections{ 2.6 0.0 }
+feff.rgrid{ 0.01 }
+feff.egrid{ 
+e_grid -200 -10 20.0
+e_grid -10 10 0.1
+k_grid last 20 0.025
+}
+feff.interstitial{0 1.0 0.75}
+#feff.ldos{ -40 10 0.2 500 }
+#feff.scframp{ 2.0 1 }
+feff.lfms2{5}
+#feff.egrid{
+#e_grid -10 10 0.1
+#k_grid last 20 0.025
+#}
+feff.fms{9.0 0 0 0.0 0.0 40.0}
+feff.rpath{9.0}
+#feff.exchange{ 0 0.0 -0.75 0 }
+feff.mpse{2 100}
+feff.opcons{True}
+#feff.corehole{ RPA }
+#feff.screen{ strength 0.5 }
+feff.MPI.CMD{ mpirun }
+feff.MPI.ARGS{ -n 20 }
+multiprocessing_ncpu{ 1 }

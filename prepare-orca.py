@@ -5,19 +5,24 @@ Process XYZ files for ORCA calculations with specified ligand composition.
 
 import argparse
 import os
-import sys
 import shutil
+import stat
 import subprocess
+import sys
 from pathlib import Path
 
 
 def get_charge_multiplicity(cys, his):
-    """Get charge and multiplicity based on cysteine and histidine counts."""
+    """
+    Get charge and multiplicity based on cysteine and histidine counts.
+    His = 54e, Cys = 34e, Zn = 28e, Water = 10e -> all even
+    Thus no matter what, 2S + 1 = odd = 1
+    """
     lookup = {
         (4, 0): (-2, 1),  # (cys, his) : (charge, mult)
-        (3, 1): (-1, 2),
+        (3, 1): (-1, 1),
         (2, 2): (0, 1),
-        (1, 3): (1, 2),
+        (1, 3): (1, 1),
         (0, 4): (2, 1),
     }
     return lookup.get((cys, his), (None, None))
@@ -43,6 +48,69 @@ def extract_ca_atoms(comments_file):
     return ca_atoms
 
 
+def clean_xyz_and_comments(input_path, clean_path=None, comments_path=None):
+    """Clean XYZ and extract trailing comments to a sidecar file."""
+    input_path = Path(input_path)
+    base = input_path.name.split(".")[0].split("_")[0]
+    clean_path = (
+        Path(clean_path)
+        if clean_path is not None
+        else input_path.with_name(f"{base}_clean.xyz")
+    )
+    comments_path = (
+        Path(comments_path)
+        if comments_path is not None
+        else input_path.with_name(f"{base}_comments.txt")
+    )
+
+    try:
+        lines = input_path.read_text().splitlines()
+    except FileNotFoundError:
+        print(f"File not found: {input_path}", file=sys.stderr)
+        return None, None
+
+    if len(lines) < 2:
+        print("Input does not look like XYZ (missing header lines).", file=sys.stderr)
+        return None, None
+
+    header = lines[:2]
+    atom_lines = lines[2:]
+
+    cleaned = [header[0], header[1]]
+    comment_lines = [header[1]]
+
+    atom_index = 0
+    for raw in atom_lines:
+        if not raw.strip():
+            continue
+
+        # Split on # to separate inline comment.
+        main_part, hash_part, comment = raw.partition("#")
+        tokens = main_part.split()
+        if len(tokens) < 4:
+            print(f"Skipping invalid atom line: {raw}", file=sys.stderr)
+            continue
+
+        cleaned.append("{:<2} {:>12} {:>12} {:>12}".format(*tokens[:4]))
+
+        if hash_part:
+            comment_lines.append(f"Atom {atom_index}: # {comment.strip()}")
+        else:
+            comment_lines.append(f"Atom {atom_index}: (no comment)")
+
+        atom_index += 1
+
+    clean_path.write_text("\n".join(cleaned) + "\n")
+    comments_path.write_text("\n".join(comment_lines) + "\n")
+
+    # Ensure group read access for new files.
+    for path in (clean_path, comments_path):
+        mode = os.stat(path).st_mode
+        os.chmod(path, mode | stat.S_IRGRP)
+
+    return clean_path, comments_path
+
+
 def process_xyz_file(xyz_file, cys, his, template_dir, output_root, dry_run):
     """Process a single XYZ file."""
     # Extract ID from filename
@@ -63,19 +131,17 @@ def process_xyz_file(xyz_file, cys, his, template_dir, output_root, dry_run):
     os.chmod(dest_xyz, 0o644)
     print(f"  Copied {filename} to {id_dir}/")
     
-    # Run xyz_clean_and_comments.py on the XYZ file
-    xyz_script = template_dir / "xyz_clean_and_comments.py"
-    if xyz_script.exists():
-        print(f"  Running xyz_clean_and_comments.py...")
-        result = subprocess.run(
-            ["python3", str(xyz_script), str(dest_xyz)],
-            capture_output=True,
-            text=True
-        )
-        if result.returncode != 0:
-            print(f"  Warning: xyz_clean_and_comments.py returned error: {result.stderr}")
-    else:
-        print(f"  Warning: xyz_clean_and_comments.py not found at {xyz_script}")
+    # Clean XYZ and write comments sidecar
+    print("  Cleaning XYZ and extracting comments...")
+    clean_path = id_dir / f"{id_name}_clean.xyz"
+    comments_path = id_dir / f"{id_name}_comments.txt"
+    clean_result, comments_result = clean_xyz_and_comments(
+        dest_xyz,
+        clean_path=clean_path,
+        comments_path=comments_path,
+    )
+    if clean_result is None or comments_result is None:
+        print("  Warning: Failed to clean XYZ or write comments file")
     
     # Get charge and multiplicity
     charge, multiplicity = get_charge_multiplicity(cys, his)

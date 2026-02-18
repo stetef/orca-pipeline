@@ -111,7 +111,7 @@ def clean_xyz_and_comments(input_path, clean_path=None, comments_path=None):
     return clean_path, comments_path
 
 
-def process_xyz_file(xyz_file, cys, his, template_dir, output_root, dry_run):
+def process_xyz_file(xyz_file, cys, his, template_dir, output_root, dry_run, use_h_only):
     """Process a single XYZ file."""
     # Extract ID from filename
     filename = os.path.basename(xyz_file)
@@ -119,9 +119,11 @@ def process_xyz_file(xyz_file, cys, his, template_dir, output_root, dry_run):
     id_name = filename.split(".")[0].split("_")[0]
     
     print(f"\nProcessing {filename} -> ID: {id_name}")
+
+    output_base = f"{id_name}-H-only" if use_h_only else id_name
     
     # Create directory for this ID under output root
-    id_dir = output_root / id_name
+    id_dir = output_root / output_base
     id_dir.mkdir(exist_ok=True)
     print(f"  Created directory: {id_dir}")
     
@@ -133,8 +135,8 @@ def process_xyz_file(xyz_file, cys, his, template_dir, output_root, dry_run):
     
     # Clean XYZ and write comments sidecar
     print("  Cleaning XYZ and extracting comments...")
-    clean_path = id_dir / f"{id_name}_clean.xyz"
-    comments_path = id_dir / f"{id_name}_comments.txt"
+    clean_path = id_dir / f"{output_base}_clean.xyz"
+    comments_path = id_dir / f"{output_base}_comments.txt"
     clean_result, comments_result = clean_xyz_and_comments(
         dest_xyz,
         clean_path=clean_path,
@@ -147,8 +149,8 @@ def process_xyz_file(xyz_file, cys, his, template_dir, output_root, dry_run):
     charge, multiplicity = get_charge_multiplicity(cys, his)
     
     # Copy and modify template
-    template_file = template_dir / "orca_template.in"
-    output_file = id_dir / f"{id_name}.in"
+    template_file = template_dir / ("orca_template_H_only.in" if use_h_only else "orca_template.in")
+    output_file = id_dir / f"{output_base}.in"
     
     if not template_file.exists():
         print(f"  Error: Template file not found: {template_file}")
@@ -160,37 +162,39 @@ def process_xyz_file(xyz_file, cys, his, template_dir, output_root, dry_run):
     # Replace placeholders
     template_content = template_content.replace('[CHARGE]', str(charge))
     template_content = template_content.replace('[MULTIPLICITY]', str(multiplicity))
-    template_content = template_content.replace('[PDB_ID]', id_name)
+    template_content = template_content.replace('[PDB_ID]', output_base)
     template_content = template_content.replace('[ID_DIR]', str(id_dir))
     
-    # Extract CA atoms from comments file
-    comments_file = id_dir / f"{id_name}_comments.txt"
-    ca_atoms = extract_ca_atoms(comments_file)
-    
-    # Build CA constraint lines based on [CA_ATOM] placeholder
-    ca_constraints = []
-    for atom_num in ca_atoms:
-        constraint_line = f"  {{C {atom_num} C}}  # Freeze all coordinates (X, Y, Z) of atom {atom_num}"
-        ca_constraints.append(constraint_line)
+    ca_atoms = []
+    if not use_h_only:
+        # Extract CA atoms from comments file
+        comments_file = id_dir / f"{output_base}_comments.txt"
+        ca_atoms = extract_ca_atoms(comments_file)
 
-    # Replace the single [CA_ATOM] line with multiple lines (one per CA atom)
-    if '[CA_ATOM]' in template_content:
-        if ca_constraints:
-            template_lines = template_content.splitlines()
-            replaced_lines = []
-            replaced = False
-            for line in template_lines:
-                if '[CA_ATOM]' in line and not replaced:
-                    replaced_lines.extend(ca_constraints)
-                    replaced = True
-                else:
-                    replaced_lines.append(line)
-            template_content = "\n".join(replaced_lines)
-        else:
-            print("  Warning: No CA atoms found to replace [CA_ATOM]")
-    elif ca_constraints:
-        print("  Warning: No [CA_ATOM] placeholder found in template")
-        print(f"  Found {len(ca_constraints)} CA atoms to constrain")
+        # Build CA constraint lines based on [CA_ATOM] placeholder
+        ca_constraints = []
+        for atom_num in ca_atoms:
+            constraint_line = f"  {{C {atom_num} C}}  # Freeze all coordinates (X, Y, Z) of atom {atom_num}"
+            ca_constraints.append(constraint_line)
+
+        # Replace the single [CA_ATOM] line with multiple lines (one per CA atom)
+        if '[CA_ATOM]' in template_content:
+            if ca_constraints:
+                template_lines = template_content.splitlines()
+                replaced_lines = []
+                replaced = False
+                for line in template_lines:
+                    if '[CA_ATOM]' in line and not replaced:
+                        replaced_lines.extend(ca_constraints)
+                        replaced = True
+                    else:
+                        replaced_lines.append(line)
+                template_content = "\n".join(replaced_lines)
+            else:
+                print("  Warning: No CA atoms found to replace [CA_ATOM]")
+        elif ca_constraints:
+            print("  Warning: No [CA_ATOM] placeholder found in template")
+            print(f"  Found {len(ca_constraints)} CA atoms to constrain")
     
     # Ensure final newline (some ORCA versions can misread the last line without it)
     if not template_content.endswith("\n"):
@@ -202,7 +206,10 @@ def process_xyz_file(xyz_file, cys, his, template_dir, output_root, dry_run):
     os.chmod(output_file, 0o644)
     print(f"  Created input file: {output_file}")
     print(f"    CHARGE={charge}, MULTIPLICITY={multiplicity}")
-    print(f"    CA atoms to freeze: {len(ca_atoms)}")
+    if use_h_only:
+        print("    Only optimizing hydrogen atoms")
+    else:
+        print(f"    CA atoms to freeze: {len(ca_atoms)}")
     
     # Copy run_job.sh script
     run_script = template_dir / "run_job.sh"
@@ -216,7 +223,7 @@ def process_xyz_file(xyz_file, cys, his, template_dir, output_root, dry_run):
         run_args = ["./run_job.sh"]
         if dry_run:
             run_args.append("--dry-run")
-        run_args.append(f"{id_name}.in")
+        run_args.append(f"{output_base}.in")
 
         run_label = "dry-run" if dry_run else "run"
         print(f"  Running {run_label}...")
@@ -241,6 +248,7 @@ def main():
     parser.add_argument('--cys', type=int, required=True, help='Number of cysteines')
     parser.add_argument('--his', type=int, required=True, help='Number of histidines')
     parser.add_argument('--out-dir', type=str, default=None, help='Output directory for ID folders')
+    parser.add_argument('--H', action='store_true', help='Use orca_template_H_only.in instead of orca_template.in')
     parser.add_argument('-n', '--dry-run', action='store_true', help='Run run_job.sh with --dry-run')
     
     args = parser.parse_args()
@@ -289,7 +297,15 @@ def main():
     print(f"Output root: {output_root}")
     
     for xyz_file in xyz_files:
-        process_xyz_file(xyz_file, args.cys, args.his, template_dir, output_root, args.dry_run)
+        process_xyz_file(
+            xyz_file,
+            args.cys,
+            args.his,
+            template_dir,
+            output_root,
+            args.dry_run,
+            args.H,
+        )
     
     print("\nProcessing complete!")
 

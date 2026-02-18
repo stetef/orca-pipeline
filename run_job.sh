@@ -46,7 +46,7 @@ cat > generated-${basename}-orca.script <<EOF
 #!/bin/bash
 #PBS -l nodes=1:ppn=${nodes:=1}
 #PBS -S /bin/bash
-#PBS -N ${basename}-test
+#PBS -N orca-${basename}
 #PBS -q workq
 #PBS -V
 
@@ -77,7 +77,7 @@ if [[ ! -x "\$ORCA_EXEC" ]]; then
   exit 1
 fi
 
-logfile=\$PBS_O_WORKDIR/${basename}.log
+logfile=\$PBS_O_WORKDIR/${basename}-orca.log
 tdir=\$(mktemp -d /home/stetef/working-station/scratch/orca-run-${basename}__XXXXXX)
 
 trap '

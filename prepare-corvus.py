@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -267,7 +268,7 @@ def _write_dym_file(
     Line 1 - dym_Type: Dynamical matrix file type (integer)
         This value is for future use. Set to 1 for now.
     Line 2 - nAt: Number of atoms (integer)
-        Number of atoms in the system. (61 in this case)
+        Number of atoms in the system.
     Lines 2..2+nAt - Atomic numbers (integer)
         Atomic numbers of atoms in the system.
     Lines 2+nAt+1..2+2*nAt - Atomic masses (real, in AMU)
@@ -305,11 +306,12 @@ def _copy_and_replace_qsub(template_path: Path, dest_path: Path, run_dir: Path, 
 
 
 def _copy_and_replace_corvus(
-    template_path: Path, dest_path: Path, run_dir: Path, run_id: str
+    template_path: Path, dest_path: Path, run_dir: Path, run_id: str, num_procs: str
 ) -> None:
     content = template_path.read_text(encoding="utf-8")
     content = content.replace("[DIRECTORY]", f"{run_dir}/")
     content = content.replace("[ID]", run_id)
+    content = content.replace("[PROCS]", str(num_procs))
     dest_path.write_text(content, encoding="utf-8")
 
 
@@ -369,8 +371,9 @@ def main() -> int:
     ]
     subprocess.run(dym2feffinp_cmd, check=True, cwd=run_dir)
 
+    num_procs = int(os.environ.get('PBS_NUM_PPN', '16'))
     corvus_in_dest = run_dir / f"corvus-{run_id}.in"
-    _copy_and_replace_corvus(corvus_template_path, corvus_in_dest, run_dir, run_id)
+    _copy_and_replace_corvus(corvus_template_path, corvus_in_dest, run_dir, run_id, num_procs)
 
     qsub_dest = run_dir / "corvus-qsub.script"
     _copy_and_replace_qsub(qsub_template_path, qsub_dest, run_dir, run_id)

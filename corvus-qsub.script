@@ -7,8 +7,13 @@
 #PBS -e corvus-[ID].serr
 cd "$PBS_O_WORKDIR"
 module load openmpi/4.0.5-gcc-8.3.1
+
+# Pass PBS_NUM_PPN to the corvus template
+export NUM_PROCS=${PBS_NUM_PPN:-16}  # fallback to 16 if not set
+
 mkdir -p "$PWD/Corvus3_cfavg_xas/Corvus1Zn_FEFF"
 cp -f [directory]corvus-[ID].dym "$PWD/Corvus3_cfavg_xas/Corvus1Zn_FEFF/corvus-[ID].dym"
+
 "$HOME/.conda/envs/corvusenv/bin/run-corvus" -i [directory]corvus-[ID].in >& [directory]corvus-[ID].out
 run_status=$?
 echo "run-corvus exit code: $run_status"

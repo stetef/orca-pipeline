@@ -5,6 +5,7 @@ Process XYZ files for ORCA calculations with specified ligand composition.
 
 import argparse
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -111,6 +112,66 @@ def clean_xyz_and_comments(input_path, clean_path=None, comments_path=None):
     return clean_path, comments_path
 
 
+def extract_nprocs(orcar_input_file):
+    """Extract number of processors from ORCA input (PAL or %pal nprocs)."""
+    try:
+        lines = Path(orcar_input_file).read_text().splitlines()
+    except FileNotFoundError:
+        return 1
+
+    pal_pattern = re.compile(r"\bPAL\s*([0-9]+)", re.IGNORECASE)
+    nprocs_pattern = re.compile(r"\bnprocs\s*([0-9]+)", re.IGNORECASE)
+
+    in_pal_block = False
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+
+        if line.startswith("!"):
+            match = pal_pattern.search(line)
+            if match:
+                return int(match.group(1))
+
+        if line.lower().startswith("%pal"):
+            # Handle both styles:
+            #   %pal nprocs 16
+            #   %pal
+            #     nprocs 16
+            match = nprocs_pattern.search(line)
+            if match:
+                return int(match.group(1))
+            in_pal_block = True
+            continue
+
+        if in_pal_block:
+            match = nprocs_pattern.search(line)
+            if match:
+                return int(match.group(1))
+            if line.lower() == "end":
+                in_pal_block = False
+
+    return 1
+
+
+def generate_orca_qsub_script(template_dir, id_dir, input_filename, basename, nprocs):
+    """Generate a PBS qsub script from template."""
+    qsub_template = template_dir / "orca-qsub.script"
+    if not qsub_template.exists():
+        print(f"  Error: Qsub template not found: {qsub_template}")
+        return None
+
+    qsub_content = qsub_template.read_text()
+    qsub_content = qsub_content.replace("[NODES]", str(nprocs or 1))
+    qsub_content = qsub_content.replace("[BASENAME]", basename)
+    qsub_content = qsub_content.replace("[INPUT_FILE]", input_filename)
+
+    generated_qsub = id_dir / f"generated-{basename}-orca.script"
+    generated_qsub.write_text(qsub_content if qsub_content.endswith("\n") else qsub_content + "\n")
+    os.chmod(generated_qsub, 0o755)
+    return generated_qsub
+
+
 def process_xyz_file(xyz_file, cys, his, template_dir, output_root, dry_run, use_h_only):
     """Process a single XYZ file."""
     # Extract ID from filename
@@ -149,7 +210,7 @@ def process_xyz_file(xyz_file, cys, his, template_dir, output_root, dry_run, use
     charge, multiplicity = get_charge_multiplicity(cys, his)
     
     # Copy and modify template
-    template_file = template_dir / ("orca_template_H_only.in" if use_h_only else "orca_template.in")
+    template_file = template_dir / ("orca-template-h-only.in" if use_h_only else "orca-template.in")
     output_file = id_dir / f"{output_base}.in"
     
     if not template_file.exists():
@@ -211,33 +272,43 @@ def process_xyz_file(xyz_file, cys, his, template_dir, output_root, dry_run, use
     else:
         print(f"    CA atoms to freeze: {len(ca_atoms)}")
     
-    # Copy run_job.sh script
-    run_script = template_dir / "run_job.sh"
-    if run_script.exists():
-        dest_script = id_dir / "run_job.sh"
-        shutil.copy2(run_script, dest_script)
-        os.chmod(dest_script, 0o755)
-        print(f"  Copied run_job.sh to {id_dir}/")
-        
-        # Run job (optionally dry-run)
-        run_args = ["./run_job.sh"]
-        if dry_run:
-            run_args.append("--dry-run")
-        run_args.append(f"{output_base}.in")
+    # Generate and (optionally) submit qsub script
+    nprocs = extract_nprocs(output_file)
+    generated_qsub = generate_orca_qsub_script(
+        template_dir,
+        id_dir,
+        f"{output_base}.in",
+        output_base,
+        nprocs,
+    )
+    if generated_qsub is None:
+        return
 
-        run_label = "dry-run" if dry_run else "run"
-        print(f"  Running {run_label}...")
+    print(f"  Generated qsub script: {generated_qsub.name}")
+    if dry_run:
+        print(f"  Dry run: generated {generated_qsub.name} (qsub skipped)")
+    else:
+        qsub_cmd = [
+            "qsub",
+            "-j",
+            "oe",
+            "-o",
+            f"{generated_qsub.name}.out",
+            generated_qsub.name,
+        ]
+        print("  Submitting with qsub...")
         result = subprocess.run(
-            run_args,
+            qsub_cmd,
             cwd=id_dir,
             capture_output=True,
-            text=True
+            text=True,
         )
-        print(f"  {run_label.capitalize()} output:\n{result.stdout}")
+        if result.stdout:
+            print(f"  qsub output:\n{result.stdout}")
         if result.stderr:
-            print(f"  {run_label.capitalize()} stderr:\n{result.stderr}")
-    else:
-        print(f"  Warning: run_job.sh not found at {run_script}")
+            print(f"  qsub stderr:\n{result.stderr}")
+        if result.returncode != 0:
+            print(f"  Warning: qsub submission failed (exit code {result.returncode})")
 
 
 def main():
@@ -248,8 +319,8 @@ def main():
     parser.add_argument('--cys', type=int, required=True, help='Number of cysteines')
     parser.add_argument('--his', type=int, required=True, help='Number of histidines')
     parser.add_argument('--out-dir', type=str, default=None, help='Output directory for ID folders')
-    parser.add_argument('--H', action='store_true', help='Use orca_template_H_only.in instead of orca_template.in')
-    parser.add_argument('-n', '--dry-run', action='store_true', help='Run run_job.sh with --dry-run')
+    parser.add_argument('--H', action='store_true', help='Use orca-template-h-only.in instead of orca-template.in')
+    parser.add_argument('-n', '--dry-run', action='store_true', help='Generate qsub script but skip qsub submission')
     
     args = parser.parse_args()
     
@@ -272,26 +343,56 @@ def main():
     template_dir = Path(__file__).parent.absolute()
     
     # Determine output root (default to directory where the script is invoked)
-    output_root = Path(args.out_dir).resolve() if args.out_dir else Path.cwd().resolve()
+    if args.out_dir:
+        raw_out_dir = Path(args.out_dir)
+        if not raw_out_dir.is_absolute() and str(raw_out_dir).startswith("home/"):
+            fixed_out_dir = Path("/") / raw_out_dir
+            print(
+                "Warning: --out-dir looks like an absolute path missing a leading '/'. "
+                f"Using: {fixed_out_dir}"
+            )
+            output_root = fixed_out_dir.resolve()
+        else:
+            output_root = raw_out_dir.resolve()
+            if not raw_out_dir.is_absolute():
+                print(
+                    "Warning: --out-dir is relative. "
+                    f"It resolves to: {output_root}"
+                )
+    else:
+        output_root = Path.cwd().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
 
     # Find all XYZ files in the specified directory
     target_path = Path(args.path)
+    target_path_was_absolute = target_path.is_absolute()
     if not target_path.exists():
         print(f"ERROR: Path not found: {target_path}")
         sys.exit(1)
+
+    target_path_resolved = target_path.resolve()
 
     if target_path.is_file():
         if target_path.suffix.lower() != ".xyz":
             print(f"ERROR: File is not an XYZ file: {target_path}")
             sys.exit(1)
         xyz_files = [target_path]
+        input_base_dir = target_path_resolved.parent
     else:
         xyz_files = list(target_path.glob("*.xyz"))
+        input_base_dir = target_path_resolved
 
         if not xyz_files:
             print(f"No XYZ files found in {target_path}")
             sys.exit(0)
+
+    if input_base_dir != output_root:
+        output_was_absolute = Path(args.out_dir).is_absolute() if args.out_dir else True
+        print(
+            "Warning: Input XYZ location and output directory differ: "
+            f"input={input_base_dir} ({'absolute' if target_path_was_absolute else 'relative'} path), "
+            f"output={output_root} ({'absolute' if output_was_absolute else 'relative'} path)"
+        )
     
     print(f"\nFound {len(xyz_files)} XYZ file(s) to process")
     print(f"Output root: {output_root}")

@@ -43,9 +43,9 @@ def load_chi_dat(path: Path):
     return k, chi
 
 
-def parse_xmu_nlegs2_distances(path: Path):
+def parse_xmu_nlegs2_entries(path: Path):
     in_table = False
-    distances = []
+    entries = []
     with path.open("r", encoding="utf-8") as handle:
         for raw_line in handle:
             line = raw_line.strip()
@@ -65,16 +65,17 @@ def parse_xmu_nlegs2_distances(path: Path):
                 continue
 
             try:
+                sig2_tot = float(fields[1])
                 nlegs = int(float(fields[-2]))
                 reff = float(fields[-1])
             except ValueError:
                 continue
             if nlegs == 2:
-                distances.append(reff)
+                entries.append({"reff": reff, "sig2_tot": sig2_tot})
 
-    if not distances:
-        raise ValueError(f"No nlegs=2 distances found in {path}")
-    return np.array(distances, dtype=float)
+    if not entries:
+        raise ValueError(f"No nlegs=2 entries found in {path}")
+    return entries
 
 
 def parse_feff_atoms(path: Path):
@@ -138,11 +139,12 @@ def has_atoms_block(path: Path) -> bool:
     return False
 
 
-def match_nlegs2_to_atoms(nlegs2_distances, atoms, tolerance=0.03):
+def match_nlegs2_to_atoms(nlegs2_entries, atoms, tolerance=0.03):
     matched = []
     used_indices = set()
 
-    for distance in sorted(nlegs2_distances):
+    for entry in sorted(nlegs2_entries, key=lambda item: item["reff"]):
+        distance = entry["reff"]
         best_atom = None
         best_delta = float("inf")
         for atom in atoms:
@@ -155,7 +157,9 @@ def match_nlegs2_to_atoms(nlegs2_distances, atoms, tolerance=0.03):
                 best_atom = atom
 
         if best_atom is not None and best_delta <= tolerance:
-            matched.append(best_atom)
+            matched_atom = dict(best_atom)
+            matched_atom["sig2_tot"] = entry["sig2_tot"]
+            matched.append(matched_atom)
             used_indices.add(best_atom["index"])
 
     if not matched:
@@ -208,9 +212,9 @@ def write_dw_dat(feff_dir: Path):
 
     feff_path = resolve_feff_inp_path(feff_dir)
 
-    nlegs2_distances = parse_xmu_nlegs2_distances(xmu_path)
+    nlegs2_entries = parse_xmu_nlegs2_entries(xmu_path)
     atoms = parse_feff_atoms(feff_path)
-    matched_atoms = match_nlegs2_to_atoms(nlegs2_distances, atoms)
+    matched_atoms = match_nlegs2_to_atoms(nlegs2_entries, atoms)
 
     nearest_atoms = [atom for atom in matched_atoms if atom["distance"] > 1e-8]
     nearest_atoms = sorted(nearest_atoms, key=lambda atom: atom["distance"])[:4]
@@ -222,12 +226,12 @@ def write_dw_dat(feff_dir: Path):
     with out_path.open("w", encoding="utf-8") as handle:
         handle.write("# Derived from xmu.dat nlegs=2 reff distances matched to feff.inp ATOMS\n")
         handle.write("# Closest four atoms to Zn/origin\n")
-        handle.write("group symbol x y z distance atom_index\n")
+        handle.write("group symbol x y z distance sig2_tot atom_index\n")
         for atom in nearest_atoms:
             handle.write(
                 "nearest "
                 f"{atom['symbol']} {atom['x']:.5f} {atom['y']:.5f} {atom['z']:.5f} "
-                f"{atom['distance']:.5f} {atom['index']}\n"
+                f"{atom['distance']:.5f} {atom['sig2_tot']:.5f} {atom['index']}\n"
             )
 
         handle.write("# Four farthest C atoms (CA-like endpoint carbons, distinct by geometry)\n")
@@ -235,7 +239,7 @@ def write_dw_dat(feff_dir: Path):
             handle.write(
                 "ca_like "
                 f"{atom['symbol']} {atom['x']:.5f} {atom['y']:.5f} {atom['z']:.5f} "
-                f"{atom['distance']:.5f} {atom['index']}\n"
+                f"{atom['distance']:.5f} {atom['sig2_tot']:.5f} {atom['index']}\n"
             )
 
     return out_path

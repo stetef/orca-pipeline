@@ -1,0 +1,92 @@
+#!/bin/bash
+#PBS -l nodes=1:ppn=[NODES]
+#PBS -S /bin/bash
+#PBS -N orca-[BASENAME]
+#PBS -q workq
+#PBS -V
+
+# Load modules
+if [[ -f /etc/profile.d/modules.sh ]]; then
+  # Initialize environment-modules for non-interactive shells
+  source /etc/profile.d/modules.sh
+fi
+module purge
+module load intel/2021.2.0
+module load openmpi/4.0.5-intel-2021.2.0
+module list
+
+shopt -s extglob nullglob
+
+export PBS_O_WORKDIR=${PBS_O_WORKDIR:-$PWD}
+export PBS_O_HOST=${PBS_O_HOST:-$(hostname)}
+export PBS_O_PATH=${PBS_O_PATH:-$PATH}
+
+# Reduce UCX verbosity
+export UCX_LOG_LEVEL=error
+
+export ORCA_HOME=/opt/bin
+export PATH="$ORCA_HOME:$PATH"
+ORCA_EXEC="$ORCA_HOME/orca"
+if [[ ! -x "$ORCA_EXEC" ]]; then
+  echo "ORCA not found at $ORCA_EXEC" >&2
+  exit 1
+fi
+
+logfile=$PBS_O_WORKDIR/[BASENAME]-orca.log
+tdir=$(mktemp -d /home/stetef/working-station/scratch/orca-run-[BASENAME]__XXXXXX)
+
+trap '
+echo "Job terminated from outer space!" >> $logfile
+rm -rf $tdir
+exit
+' TERM
+
+cp "$PBS_O_WORKDIR/[INPUT_FILE]" "$tdir"
+for f in "$PBS_O_WORKDIR"/*.gbw "$PBS_O_WORKDIR"/*.pot; do
+  [[ -e "$f" ]] || continue
+  cp "$f" "$tdir"
+done
+cd "$tdir"
+
+# Ensure mpirun exists if module only provides mpiexec
+MPIEXEC=$(command -v mpirun || command -v mpiexec || true)
+if [[ -z "$MPIEXEC" ]]; then
+  echo "mpirun/mpiexec not found in PATH" >> $logfile
+  exit 1
+fi
+MPI_DIR=$(dirname "$MPIEXEC")
+if [[ ! -x "$MPI_DIR/mpirun" && -x "$MPI_DIR/mpiexec" ]]; then
+  mkdir -p "$tdir/mpi-bin"
+  ln -s "$MPI_DIR/mpiexec" "$tdir/mpi-bin/mpirun"
+  export PATH="$tdir/mpi-bin:$MPI_DIR:$PATH"
+  echo "Created mpirun shim -> mpiexec in $tdir/mpi-bin" >> $logfile
+fi
+
+echo "Job started from ${PBS_O_HOST}, running on $(hostname) in $tdir using $ORCA_EXEC" > $logfile
+echo "--- MODULES ---" >> $logfile
+module list 2>> $logfile
+echo "--- MODULE SHOW (openmpi/4.0.5-intel-2021.2.0) ---" >> $logfile
+module show openmpi/4.0.5-intel-2021.2.0 2>> $logfile
+echo "--- MPI ---" >> $logfile
+echo "PATH=$PATH" >> $logfile
+which mpirun >> $logfile 2>&1
+which mpiexec >> $logfile 2>&1
+
+start_epoch=$(date +%s)
+echo "start_epoch=$start_epoch" > "$PBS_O_WORKDIR/[BASENAME]-orca.timing"
+echo "hostname=$(hostname)" >> "$PBS_O_WORKDIR/[BASENAME]-orca.timing"
+
+"$ORCA_EXEC" "[INPUT_FILE]" 1>>"$logfile" 2>&1
+orca_status=$?
+end_epoch=$(date +%s)
+elapsed=$((end_epoch - start_epoch))
+echo "end_epoch=$end_epoch" >> "$PBS_O_WORKDIR/[BASENAME]-orca.timing"
+echo "elapsed_seconds=$elapsed" >> "$PBS_O_WORKDIR/[BASENAME]-orca.timing"
+echo "exit_code=$orca_status" >> "$PBS_O_WORKDIR/[BASENAME]-orca.timing"
+if [[ $orca_status -ne 0 ]]; then
+  echo "ORCA exited with code $orca_status" >> "$logfile"
+fi
+
+cp !(*.inp|*.tmp*) "$PBS_O_WORKDIR"/
+rm -rf "$tdir"
+exit $orca_status

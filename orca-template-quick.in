@@ -1,0 +1,3 @@
+! B97-3c CPCM(WATER) OPT PAL16
+
+*xyzfile [CHARGE] [MULTIPLICITY] [ID_DIR]/[PDB_ID]_clean.xyz

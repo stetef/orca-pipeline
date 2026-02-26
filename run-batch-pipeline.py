@@ -67,6 +67,43 @@ def _check_executable(name: str) -> None:
         raise RuntimeError(f"Required executable not found in PATH: {name}")
 
 
+def _dependency_debug_command(job_id: str) -> str:
+    return (
+        f"tracejob -n 100 {job_id} 2>&1 | "
+        "grep -Ei 'deleted as result of dependency|Dependency on job|Exit_status|Obit'"
+    )
+
+
+def _append_batch_job_log(log_path: Path, job_name: str, status: str, job_id: str | None = None) -> None:
+    if job_id is None:
+        line = f"{job_name}\t{status}\n"
+    else:
+        dep_cmd = _dependency_debug_command(job_id)
+        line = f"{job_name}\t{status}\tjob_id={job_id}\tdep_debug=\"{dep_cmd}\"\n"
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(line)
+
+
+def _initialize_batch_log(log_path: Path) -> None:
+    if not log_path.exists():
+        log_path.write_text(
+            "# Helpful PBS debug commands (replace <JOB_ID>)\n"
+            "# dependency-deletion check:\n"
+            "#   tracejob -n 100 <JOB_ID> 2>&1 | grep -Ei 'deleted as result of dependency|Dependency on job|Exit_status|Obit'\n"
+            "# full tracejob history:\n"
+            "#   tracejob -n 200 <JOB_ID>\n"
+            "# full scheduler history (if enabled):\n"
+            "#   qstat -x -f <JOB_ID>\n"
+            "\n"
+            "job_name\tstatus\tjob_id\tdep_debug\n",
+            encoding="utf-8",
+        )
+        return
+
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(f"# --- invocation {_utc_now_iso()} ---\n")
+
+
 def _run_command(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
 
@@ -257,6 +294,8 @@ def main() -> int:
 
     output_root = args.out_dir.expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
+    batch_log = output_root / "batch-jobs.log"
+    _initialize_batch_log(batch_log)
 
     download_destination = args.download_destination.expanduser().resolve()
 
@@ -279,11 +318,13 @@ def main() -> int:
 
     prep_result = _run_command(prepare_cmd)
     if prep_result.returncode != 0:
+        _append_batch_job_log(batch_log, "prepare-orca", "FAILED")
         raise RuntimeError(
             "prepare-orca.py failed:\n"
             f"stdout:\n{prep_result.stdout}\n"
             f"stderr:\n{prep_result.stderr}"
         )
+    _append_batch_job_log(batch_log, "prepare-orca", "SUCCEEDED")
 
     records: list[JobRecord] = []
     for xyz in xyz_files:
@@ -310,11 +351,23 @@ def main() -> int:
             orca_submitted_utc = _utc_now_iso()
             corvus_job_id = "NO_SUBMIT"
             corvus_submitted_utc = _utc_now_iso()
+            _append_batch_job_log(batch_log, f"orca-{run_id}", "SKIPPED")
+            _append_batch_job_log(batch_log, f"corvus-{run_id}", "SKIPPED")
         else:
             orca_submitted_utc = _utc_now_iso()
-            orca_job_id = _submit_job(orca_script, cwd=run_dir)
+            try:
+                orca_job_id = _submit_job(orca_script, cwd=run_dir)
+                _append_batch_job_log(batch_log, f"orca-{run_id}", "SUCCEEDED", job_id=orca_job_id)
+            except Exception:
+                _append_batch_job_log(batch_log, f"orca-{run_id}", "FAILED")
+                raise
             corvus_submitted_utc = _utc_now_iso()
-            corvus_job_id = _submit_job(corvus_wrapper, cwd=run_dir, depend_afterok=[orca_job_id])
+            try:
+                corvus_job_id = _submit_job(corvus_wrapper, cwd=run_dir, depend_afterok=[orca_job_id])
+                _append_batch_job_log(batch_log, f"corvus-{run_id}", "SUCCEEDED", job_id=corvus_job_id)
+            except Exception:
+                _append_batch_job_log(batch_log, f"corvus-{run_id}", "FAILED")
+                raise
 
         records.append(
             JobRecord(
@@ -343,9 +396,20 @@ def main() -> int:
     postprocess_job_id: str | None
     if args.no_submit:
         postprocess_job_id = "NO_SUBMIT"
+        _append_batch_job_log(batch_log, f"postprocess-{output_root.name}", "SKIPPED")
     else:
         corvus_ids = [rec.corvus_job_id for rec in records]
-        postprocess_job_id = _submit_job(postprocess_script, cwd=output_root, depend_afterok=corvus_ids)
+        try:
+            postprocess_job_id = _submit_job(postprocess_script, cwd=output_root, depend_afterok=corvus_ids)
+            _append_batch_job_log(
+                batch_log,
+                f"postprocess-{output_root.name}",
+                "SUCCEEDED",
+                job_id=postprocess_job_id,
+            )
+        except Exception:
+            _append_batch_job_log(batch_log, f"postprocess-{output_root.name}", "FAILED")
+            raise
 
     state_file = (
         args.state_file.expanduser().resolve()
@@ -384,6 +448,7 @@ def main() -> int:
         )
     print(f"Postprocess job: {postprocess_job_id}")
     print(f"State file: {state_file}")
+    print(f"Batch job log: {batch_log}")
     return 0
 
 

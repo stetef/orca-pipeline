@@ -11,9 +11,9 @@ Workflow overview (per structure ID):
 
 Batch-level postprocess:
 4) Submit one dependent postprocess qsub job (afterok on *all* CORVUS jobs) that runs:
-   - extract-orca-compute-times.py
-   - process-feff-output.py --recursive
-   - prepare-files-for-download.py
+   - script-extract-orca-compute-times.py
+   - script-process-feff-output.py --recursive
+   - script-prepare-files-for-download.py
 """
 
 from __future__ import annotations
@@ -162,9 +162,9 @@ def _write_postprocess_script(
     skip_process_feff: bool,
     skip_prepare_download: bool,
 ) -> None:
-    extract_py = script_dir / "extract-orca-compute-times.py"
-    process_feff_py = script_dir / "process-feff-output.py"
-    prepare_download_py = script_dir / "prepare-files-for-download.py"
+    extract_py = script_dir / "script-extract-orca-compute-times.py"
+    process_feff_py = script_dir / "script-process-feff-output.py"
+    prepare_download_py = script_dir / "script-prepare-files-for-download.py"
 
     template_path = script_dir / "postprocess-qsub.script"
     if not template_path.exists():
@@ -239,22 +239,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--download-destination",
         type=Path,
         default=Path("downloading-station"),
-        help="Destination for prepare-files-for-download.py",
+        help="Destination for script-prepare-files-for-download.py",
     )
     parser.add_argument(
         "--skip-extract",
         action="store_true",
-        help="Skip extract-orca-compute-times.py in final postprocess job",
+        help="Skip script-extract-orca-compute-times.py in final postprocess job",
     )
     parser.add_argument(
         "--skip-process-feff",
         action="store_true",
-        help="Skip process-feff-output.py in final postprocess job",
+        help="Skip script-process-feff-output.py in final postprocess job",
     )
     parser.add_argument(
         "--skip-prepare-download",
         action="store_true",
-        help="Skip prepare-files-for-download.py in final postprocess job",
+        help="Skip script-prepare-files-for-download.py in final postprocess job",
     )
     parser.add_argument(
         "--state-file",
@@ -278,7 +278,7 @@ def main() -> int:
         raise SystemExit(f"ERROR: cys + his must equal 4 (got {args.cys + args.his})")
 
     if not args.skip_process_feff:
-        # Keep explicit: process-feff-output imports numpy/matplotlib/larch at runtime.
+        # Keep explicit: script-process-feff-output imports numpy/matplotlib/larch at runtime.
         # This pre-check catches missing python early on head/login nodes.
         _check_executable("python")
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 from pathlib import Path
 from typing import Dict, List
@@ -66,12 +67,13 @@ def parse_xmu_nlegs2_entries(path: Path):
 
             try:
                 sig2_tot = float(fields[1])
+                deg = int(float(fields[3]))
                 nlegs = int(float(fields[-2]))
                 reff = float(fields[-1])
             except ValueError:
                 continue
             if nlegs == 2:
-                entries.append({"reff": reff, "sig2_tot": sig2_tot})
+                entries.append({"reff": reff, "sig2_tot": sig2_tot, "deg": deg})
 
     if not entries:
         raise ValueError(f"No nlegs=2 entries found in {path}")
@@ -104,6 +106,7 @@ def parse_feff_atoms(path: Path):
                 x = float(fields[0])
                 y = float(fields[1])
                 z = float(fields[2])
+                atom_type = int(fields[3])
                 symbol = fields[4]
                 listed_distance = float(fields[5])
                 atom_index = int(float(fields[6]))
@@ -114,6 +117,7 @@ def parse_feff_atoms(path: Path):
                 {
                     "index": atom_index,
                     "symbol": symbol,
+                    "type": atom_type,
                     "x": x,
                     "y": y,
                     "z": z,
@@ -124,6 +128,140 @@ def parse_feff_atoms(path: Path):
     if not atoms:
         raise ValueError(f"No ATOMS block parsed in {path}")
     return atoms
+
+
+def parse_xyz_atoms(path: Path):
+    atoms: List[Dict[str, float]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        raw_lines = [line.strip() for line in handle if line.strip()]
+
+    if not raw_lines:
+        raise ValueError(f"Empty XYZ file: {path}")
+
+    try:
+        natoms = int(raw_lines[0].split()[0])
+        atom_lines = raw_lines[2 : 2 + natoms]
+    except (ValueError, IndexError):
+        atom_lines = [line for line in raw_lines if len(line.split()) >= 4]
+
+    for fields_line in atom_lines:
+        fields = fields_line.split()
+        if len(fields) < 4:
+            continue
+        symbol = fields[0]
+        try:
+            x = float(fields[1])
+            y = float(fields[2])
+            z = float(fields[3])
+        except ValueError:
+            continue
+        atoms.append({"symbol": symbol, "x": x, "y": y, "z": z})
+
+    if not atoms:
+        raise ValueError(f"No atom coordinates parsed in XYZ file: {path}")
+    return atoms
+
+
+def parse_ca_indices_from_comments(path: Path):
+    pattern = re.compile(r"^Atom\s+(\d+):.*\bATOM=CA\b")
+    indices: List[int] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            match = pattern.match(line)
+            if match:
+                indices.append(int(match.group(1)))
+
+    if not indices:
+        raise ValueError(f"No ATOM=CA entries found in {path}")
+    return indices
+
+
+def find_first_zn_index(xyz_atoms):
+    for i, atom in enumerate(xyz_atoms):
+        if atom["symbol"].strip().upper() == "ZN":
+            return i
+    raise ValueError("No Zn atom found in XYZ file; cannot apply Zn-centering transform")
+
+
+def find_latest_xyz_file(run_root: Path) -> Path:
+    xyz_files = [path for path in run_root.glob("*.xyz") if path.is_file()]
+    if not xyz_files:
+        raise FileNotFoundError(f"No .xyz files found in {run_root}")
+    return max(xyz_files, key=lambda path: path.stat().st_mtime)
+
+
+def resolve_comments_file(run_root: Path, xyz_path: Path) -> Path:
+    preferred = run_root / f"{xyz_path.stem}_comments.txt"
+    if preferred.is_file():
+        return preferred
+
+    candidates = [path for path in run_root.glob("*_comments.txt") if path.is_file()]
+    if not candidates:
+        raise FileNotFoundError(
+            f"No *_comments.txt file found in {run_root}; cannot determine CA atom indices"
+        )
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def match_ca_indices_to_feff_atoms(ca_indices, xyz_atoms, feff_atoms, tolerance=2e-3):
+    zn_index = find_first_zn_index(xyz_atoms)
+    zn_coords = np.array(
+        [xyz_atoms[zn_index]["x"], xyz_atoms[zn_index]["y"], xyz_atoms[zn_index]["z"]],
+        dtype=float,
+    )
+
+    matched = []
+    used_feff_indices = set()
+    for ca_idx in ca_indices:
+        if ca_idx < 0 or ca_idx >= len(xyz_atoms):
+            raise IndexError(
+                f"CA atom index {ca_idx} from comments is out of range for XYZ with "
+                f"{len(xyz_atoms)} atoms"
+            )
+
+        src_atom = xyz_atoms[ca_idx]
+        src_symbol = src_atom["symbol"].strip().upper()
+        src_coords = np.array([src_atom["x"], src_atom["y"], src_atom["z"]], dtype=float) - zn_coords
+
+        symbol_candidates = [
+            atom
+            for atom in feff_atoms
+            if atom["index"] not in used_feff_indices
+            and atom["symbol"].strip().upper() == src_symbol
+        ]
+        candidates = symbol_candidates or [
+            atom for atom in feff_atoms if atom["index"] not in used_feff_indices
+        ]
+
+        if not candidates:
+            raise ValueError("No remaining FEFF ATOMS candidates for CA matching")
+
+        best_atom = min(
+            candidates,
+            key=lambda atom: np.linalg.norm(
+                src_coords - np.array([atom["x"], atom["y"], atom["z"]], dtype=float)
+            ),
+        )
+        best_err = float(
+            np.linalg.norm(
+                src_coords
+                - np.array([best_atom["x"], best_atom["y"], best_atom["z"]], dtype=float)
+            )
+        )
+        if best_err > tolerance:
+            raise ValueError(
+                f"CA atom index {ca_idx} failed coordinate match to FEFF ATOMS: "
+                f"best error {best_err:.6f} A exceeds tolerance {tolerance:.6f} A"
+            )
+
+        atom_with_meta = dict(best_atom)
+        atom_with_meta["source_xyz_index"] = ca_idx
+        atom_with_meta["match_error"] = best_err
+        matched.append(atom_with_meta)
+        used_feff_indices.add(best_atom["index"])
+
+    return matched
 
 
 def has_atoms_block(path: Path) -> bool:
@@ -140,31 +278,77 @@ def has_atoms_block(path: Path) -> bool:
 
 
 def match_nlegs2_to_atoms(nlegs2_entries, atoms, tolerance=0.03):
-    matched = []
-    used_indices = set()
+    # Expand xmu rows by degeneracy in row order. Each expanded slot consumes one FEFF atom.
+    slots = []
+    for entry in nlegs2_entries:
+        deg = max(1, int(entry.get("deg", 1)))
+        for _ in range(deg):
+            slots.append(
+                {
+                    "reff": float(entry["reff"]),
+                    "sig2_tot": float(entry["sig2_tot"]),
+                }
+            )
 
-    for entry in sorted(nlegs2_entries, key=lambda item: item["reff"]):
-        distance = entry["reff"]
+    # Keep FEFF ATOMS order, excluding absorber at origin.
+    ordered_atoms = [atom for atom in atoms if float(atom["distance"]) > 1e-8]
+    used_atom_indices = set()
+
+    matched = []
+    for slot in slots:
         best_atom = None
-        best_delta = float("inf")
-        for atom in atoms:
-            idx = atom["index"]
-            if idx in used_indices:
+        best_delta = None
+        for atom in ordered_atoms:
+            atom_idx = atom["index"]
+            if atom_idx in used_atom_indices:
                 continue
-            delta = abs(atom["distance"] - distance)
-            if delta < best_delta:
+            delta = abs(float(atom["distance"]) - slot["reff"])
+            if delta > tolerance:
+                continue
+            if best_delta is None or delta < best_delta:
                 best_delta = delta
                 best_atom = atom
 
-        if best_atom is not None and best_delta <= tolerance:
-            matched_atom = dict(best_atom)
-            matched_atom["sig2_tot"] = entry["sig2_tot"]
-            matched.append(matched_atom)
-            used_indices.add(best_atom["index"])
+        if best_atom is None:
+            continue
+
+        matched_atom = dict(best_atom)
+        matched_atom["sig2_tot"] = slot["sig2_tot"]
+        matched_atom["sig2_reff"] = slot["reff"]
+        matched_atom["sig2_match_delta"] = float(best_delta)
+        matched.append(matched_atom)
+        used_atom_indices.add(best_atom["index"])
 
     if not matched:
         raise ValueError("Could not match nlegs=2 distances to any ATOMS entries")
     return matched
+
+
+def find_sig2_for_distance(nlegs2_entries, distance, tolerance=0.03, require_within_tolerance=True):
+    best_entry = None
+    best_delta = None
+    for entry in nlegs2_entries:
+        delta = abs(float(distance) - float(entry["reff"]))
+        if delta > tolerance:
+            continue
+        if best_delta is None or delta < best_delta:
+            best_delta = delta
+            best_entry = entry
+
+    if best_entry is None and not require_within_tolerance:
+        # Fall back to nearest available nlegs=2 path even when outside tolerance.
+        if not nlegs2_entries:
+            return None
+        best_entry = min(nlegs2_entries, key=lambda item: abs(float(distance) - float(item["reff"])))
+        best_delta = abs(float(distance) - float(best_entry["reff"]))
+
+    if best_entry is None:
+        return None
+    return {
+        "sig2_tot": float(best_entry["sig2_tot"]),
+        "sig2_reff": float(best_entry["reff"]),
+        "sig2_match_delta": float(best_delta),
+    }
 
 
 def pick_farthest_distinct_carbons(atoms, count=4, min_pair_separation=2.0):
@@ -211,6 +395,7 @@ def write_dw_dat(feff_dir: Path):
         raise FileNotFoundError(f"Missing file: {xmu_path}")
 
     feff_path = resolve_feff_inp_path(feff_dir)
+    run_root = feff_path.parent
 
     nlegs2_entries = parse_xmu_nlegs2_entries(xmu_path)
     atoms = parse_feff_atoms(feff_path)
@@ -219,8 +404,53 @@ def write_dw_dat(feff_dir: Path):
     nearest_atoms = [atom for atom in matched_atoms if atom["distance"] > 1e-8]
     nearest_atoms = sorted(nearest_atoms, key=lambda atom: atom["distance"])[:4]
 
-    ca_like_atoms = pick_farthest_distinct_carbons(matched_atoms, count=4)
-    ca_like_atoms = sorted(ca_like_atoms, key=lambda atom: atom["distance"], reverse=True)
+    latest_xyz = find_latest_xyz_file(run_root)
+    comments_path = resolve_comments_file(run_root, latest_xyz)
+    ca_indices = parse_ca_indices_from_comments(comments_path)
+    xyz_atoms = parse_xyz_atoms(latest_xyz)
+    ca_atoms_by_coords = match_ca_indices_to_feff_atoms(ca_indices, xyz_atoms, atoms)
+
+    matched_by_index = {atom["index"]: atom for atom in matched_atoms}
+    ca_atoms = []
+    missing_sig2 = []
+    ca_fallback_count = 0
+    for ca_atom in ca_atoms_by_coords:
+        idx = ca_atom["index"]
+        if idx in matched_by_index:
+            with_sig2 = dict(matched_by_index[idx])
+        else:
+            # Fallback: assign by closest nlegs=2 reff when atom-index pairing is ambiguous.
+            fallback = find_sig2_for_distance(
+                nlegs2_entries,
+                ca_atom["distance"],
+                tolerance=0.05,
+                require_within_tolerance=True,
+            )
+            if fallback is None:
+                fallback = find_sig2_for_distance(
+                    nlegs2_entries,
+                    ca_atom["distance"],
+                    tolerance=0.05,
+                    require_within_tolerance=False,
+                )
+            if fallback is None:
+                missing_sig2.append(idx)
+                continue
+            with_sig2 = dict(ca_atom)
+            with_sig2.update(fallback)
+            with_sig2["sig2_extrapolated"] = fallback["sig2_match_delta"] > 0.05
+            ca_fallback_count += 1
+
+        with_sig2["source_xyz_index"] = ca_atom["source_xyz_index"]
+        with_sig2["match_error"] = ca_atom["match_error"]
+        ca_atoms.append(with_sig2)
+
+    if missing_sig2:
+        missing_str = ", ".join(str(val) for val in sorted(missing_sig2))
+        raise ValueError(
+            "Matched CA atoms in FEFF ATOMS are missing nlegs=2 sig2_tot assignments for "
+            f"atom indices: {missing_str}"
+        )
 
     out_path = feff_dir / "dw.dat"
     with out_path.open("w", encoding="utf-8") as handle:
@@ -234,13 +464,26 @@ def write_dw_dat(feff_dir: Path):
                 f"{atom['distance']:.5f} {atom['sig2_tot']:.5f} {atom['index']}\n"
             )
 
-        handle.write("# Four farthest C atoms (CA-like endpoint carbons, distinct by geometry)\n")
-        for atom in ca_like_atoms:
+        handle.write(
+            f"# CA atoms from {comments_path.name}, mapped from Zn-centered {latest_xyz.name} to FEFF ATOMS\n"
+        )
+        if ca_fallback_count:
             handle.write(
-                "ca_like "
+                "# note: some CA sig2_tot values used nearest available nlegs=2 reff "
+                "because no close nlegs=2 path existed\n"
+            )
+        for atom in ca_atoms:
+            handle.write(
+                "ca "
                 f"{atom['symbol']} {atom['x']:.5f} {atom['y']:.5f} {atom['z']:.5f} "
                 f"{atom['distance']:.5f} {atom['sig2_tot']:.5f} {atom['index']}\n"
             )
+
+    if ca_fallback_count:
+        print(
+            f"warning: assigned nearest nlegs=2 sig2_tot for {ca_fallback_count} CA atom(s) "
+            f"in {feff_dir / 'dw.dat'} because close nlegs=2 matches were unavailable"
+        )
 
     return out_path
 

@@ -3,7 +3,7 @@
 Find and copy output* directories from each child directory under a parent directory.
 
 Example:
-    python prepare-files-for-download.py /path/to/parent -d ./downloaded_outputs
+    python script-prepare-files-for-download.py /path/to/parent -d ./downloaded_outputs
 """
 
 import argparse

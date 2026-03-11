@@ -54,6 +54,7 @@ class BatchState:
     cys: int
     his: int
     h_only: bool
+    optimization_mode: str
     postprocess_job_id: str | None
     runs: list[JobRecord]
 
@@ -134,9 +135,9 @@ def _discover_xyz_files(path_arg: Path) -> tuple[list[Path], Path]:
     return [p.resolve() for p in xyz_files], path_arg.resolve()
 
 
-def _run_id_from_xyz(xyz_file: Path, h_only: bool) -> str:
-    base = xyz_file.name.split(".")[0].split("_")[0]
-    return f"{base}-H-only" if h_only else base
+def _run_id_from_xyz(xyz_file: Path, optimization_mode: str) -> str:
+    base = xyz_file.stem
+    return f"{base}-H-only" if optimization_mode == "h-only" else base
 
 
 def _write_corvus_wrapper_script(script_path: Path, run_dir: Path, run_id: str, prepare_corvus_py: Path) -> None:
@@ -230,10 +231,21 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Batch output directory where per-ID run dirs are created",
     )
-    parser.add_argument(
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
         "--H",
         action="store_true",
         help="Use H-only ORCA template (propagates to prepare-orca)",
+    )
+    mode_group.add_argument(
+        "--single",
+        action="store_true",
+        help="Use single-point ORCA template (propagates to prepare-orca)",
+    )
+    mode_group.add_argument(
+        "--free",
+        action="store_true",
+        help="Use no-constraints ORCA template (propagates to prepare-orca)",
     )
     parser.add_argument(
         "--download-destination",
@@ -264,6 +276,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--no-submit",
+        "--dry-run",
+        dest="no_submit",
         action="store_true",
         help="Generate scripts and state file only; do not qsub",
     )
@@ -276,6 +290,14 @@ def main() -> int:
 
     if args.cys + args.his != 4:
         raise SystemExit(f"ERROR: cys + his must equal 4 (got {args.cys + args.his})")
+
+    optimization_mode = "ca-fixed"
+    if args.H:
+        optimization_mode = "h-only"
+    elif args.single:
+        optimization_mode = "single-point"
+    elif args.free:
+        optimization_mode = "no-constraints"
 
     if not args.skip_process_feff:
         # Keep explicit: script-process-feff-output imports numpy/matplotlib/larch at runtime.
@@ -315,6 +337,10 @@ def main() -> int:
     ]
     if args.H:
         prepare_cmd.append("--H")
+    elif args.single:
+        prepare_cmd.append("--single")
+    elif args.free:
+        prepare_cmd.append("--free")
 
     prep_result = _run_command(prepare_cmd)
     if prep_result.returncode != 0:
@@ -328,7 +354,7 @@ def main() -> int:
 
     records: list[JobRecord] = []
     for xyz in xyz_files:
-        run_id = _run_id_from_xyz(xyz, h_only=args.H)
+        run_id = _run_id_from_xyz(xyz, optimization_mode=optimization_mode)
         run_dir = output_root / run_id
         if not run_dir.is_dir():
             raise FileNotFoundError(f"Expected run directory not found: {run_dir}")
@@ -424,7 +450,8 @@ def main() -> int:
         download_destination=str(download_destination),
         cys=args.cys,
         his=args.his,
-        h_only=bool(args.H),
+        h_only=optimization_mode == "h-only",
+        optimization_mode=optimization_mode,
         postprocess_job_id=postprocess_job_id,
         runs=records,
     )

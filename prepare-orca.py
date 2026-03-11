@@ -13,6 +13,14 @@ import sys
 from pathlib import Path
 
 
+TEMPLATE_FILE_BY_MODE = {
+    "ca-fixed": "orca-template-ca-fixed.in",
+    "h-only": "orca-template-h-only.in",
+    "single-point": "orca-template-single-point.in",
+    "no-constraints": "orca-template-no-constraints.in",
+}
+
+
 def get_charge_multiplicity(cys, his):
     """
     Get charge and multiplicity based on cysteine and histidine counts.
@@ -52,7 +60,8 @@ def extract_ca_atoms(comments_file):
 def clean_xyz_and_comments(input_path, clean_path=None, comments_path=None):
     """Clean XYZ and extract trailing comments to a sidecar file."""
     input_path = Path(input_path)
-    base = input_path.name.split(".")[0].split("_")[0]
+    # Use full filename stem so similarly prefixed XYZ files stay distinct.
+    base = input_path.stem
     clean_path = (
         Path(clean_path)
         if clean_path is not None
@@ -172,16 +181,15 @@ def generate_orca_qsub_script(template_dir, id_dir, input_filename, basename, np
     return generated_qsub
 
 
-def process_xyz_file(xyz_file, cys, his, template_dir, output_root, dry_run, use_h_only):
+def process_xyz_file(xyz_file, cys, his, template_dir, output_root, dry_run, template_mode):
     """Process a single XYZ file."""
-    # Extract ID from filename
+    # Extract ID from full XYZ stem (no truncation at underscores).
     filename = os.path.basename(xyz_file)
-    # First split by ".", take first part, then split by "_", take first part
-    id_name = filename.split(".")[0].split("_")[0]
+    id_name = Path(filename).stem
     
     print(f"\nProcessing {filename} -> ID: {id_name}")
 
-    output_base = f"{id_name}-H-only" if use_h_only else id_name
+    output_base = f"{id_name}-H-only" if template_mode == "h-only" else id_name
     
     # Create directory for this ID under output root
     id_dir = output_root / output_base
@@ -210,7 +218,7 @@ def process_xyz_file(xyz_file, cys, his, template_dir, output_root, dry_run, use
     charge, multiplicity = get_charge_multiplicity(cys, his)
     
     # Copy and modify template
-    template_file = template_dir / ("orca-template-h-only.in" if use_h_only else "orca-template.in")
+    template_file = template_dir / TEMPLATE_FILE_BY_MODE[template_mode]
     output_file = id_dir / f"{output_base}.in"
     
     if not template_file.exists():
@@ -227,7 +235,7 @@ def process_xyz_file(xyz_file, cys, his, template_dir, output_root, dry_run, use
     template_content = template_content.replace('[ID_DIR]', str(id_dir))
     
     ca_atoms = []
-    if not use_h_only:
+    if template_mode == "ca-fixed":
         # Extract CA atoms from comments file
         comments_file = id_dir / f"{output_base}_comments.txt"
         ca_atoms = extract_ca_atoms(comments_file)
@@ -267,8 +275,12 @@ def process_xyz_file(xyz_file, cys, his, template_dir, output_root, dry_run, use
     os.chmod(output_file, 0o644)
     print(f"  Created input file: {output_file}")
     print(f"    CHARGE={charge}, MULTIPLICITY={multiplicity}")
-    if use_h_only:
+    if template_mode == "h-only":
         print("    Only optimizing hydrogen atoms")
+    elif template_mode == "single-point":
+        print("    Running single-point style template")
+    elif template_mode == "no-constraints":
+        print("    Running unconstrained optimization template")
     else:
         print(f"    CA atoms to freeze: {len(ca_atoms)}")
     
@@ -319,10 +331,21 @@ def main():
     parser.add_argument('--cys', type=int, required=True, help='Number of cysteines')
     parser.add_argument('--his', type=int, required=True, help='Number of histidines')
     parser.add_argument('--out-dir', type=str, default=None, help='Output directory for ID folders')
-    parser.add_argument('--H', action='store_true', help='Use orca-template-h-only.in instead of orca-template.in')
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument('--H', action='store_true', help='Use orca-template-h-only.in')
+    mode_group.add_argument('--single', action='store_true', help='Use orca-template-single-point.in')
+    mode_group.add_argument('--free', action='store_true', help='Use orca-template-no-constraints.in')
     parser.add_argument('-n', '--dry-run', action='store_true', help='Generate qsub script but skip qsub submission')
-    
+
     args = parser.parse_args()
+
+    template_mode = "ca-fixed"
+    if args.H:
+        template_mode = "h-only"
+    elif args.single:
+        template_mode = "single-point"
+    elif args.free:
+        template_mode = "no-constraints"
     
     # Validate cys + his = 4
     if args.cys + args.his != 4:
@@ -338,6 +361,7 @@ def main():
     
     print(f"Configuration: {args.cys} Cys + {args.his} His")
     print(f"Charge: {charge}, Multiplicity: {multiplicity}")
+    print(f"Template mode: {template_mode}")
     
     # Get template directory (assume script is in template directory)
     template_dir = Path(__file__).parent.absolute()
@@ -405,7 +429,7 @@ def main():
             template_dir,
             output_root,
             args.dry_run,
-            args.H,
+            template_mode,
         )
     
     print("\nProcessing complete!")

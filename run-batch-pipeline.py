@@ -51,8 +51,6 @@ class BatchState:
     input_path: str
     output_root: str
     download_destination: str
-    cys: int
-    his: int
     h_only: bool
     optimization_mode: str
     postprocess_job_id: str | None
@@ -223,13 +221,14 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument("path", type=Path, help="XYZ directory or single XYZ file")
-    parser.add_argument("--cys", type=int, required=True, help="Number of cysteine ligands")
-    parser.add_argument("--his", type=int, required=True, help="Number of histidine ligands")
     parser.add_argument(
         "--out-dir",
         type=Path,
-        required=True,
-        help="Batch output directory where per-ID run dirs are created",
+        required=False,
+        help=(
+            "Batch output directory where per-ID run dirs are created "
+            "(default: parent of input XYZ directory)"
+        ),
     )
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
@@ -246,6 +245,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--free",
         action="store_true",
         help="Use no-constraints ORCA template (propagates to prepare-orca)",
+    )
+    mode_group.add_argument(
+        "--backbone",
+        action="store_true",
+        help="Use backbone point-charge ORCA template (propagates to prepare-orca)",
+    )
+    mode_group.add_argument(
+        "--xtb-free",
+        action="store_true",
+        help="Use XTB-free ORCA template mode (propagates to prepare-orca)",
+    )
+    mode_group.add_argument(
+        "--xtb-constrained",
+        action="store_true",
+        help="Use XTB-constrained ORCA template mode (propagates to prepare-orca)",
     )
     parser.add_argument(
         "--download-destination",
@@ -288,9 +302,6 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
-    if args.cys + args.his != 4:
-        raise SystemExit(f"ERROR: cys + his must equal 4 (got {args.cys + args.his})")
-
     optimization_mode = "ca-fixed"
     if args.H:
         optimization_mode = "h-only"
@@ -298,6 +309,12 @@ def main() -> int:
         optimization_mode = "single-point"
     elif args.free:
         optimization_mode = "no-constraints"
+    elif args.backbone:
+        optimization_mode = "backbone"
+    elif args.xtb_free:
+        optimization_mode = "xtb-free"
+    elif args.xtb_constrained:
+        optimization_mode = "xtb-constrained"
 
     if not args.skip_process_feff:
         # Keep explicit: script-process-feff-output imports numpy/matplotlib/larch at runtime.
@@ -314,23 +331,23 @@ def main() -> int:
     if not prepare_orca_py.exists() or not prepare_corvus_py.exists():
         raise SystemExit("ERROR: Missing prepare-orca.py or prepare-corvus.py next to this script")
 
-    output_root = args.out_dir.expanduser().resolve()
+    xyz_files, input_base_dir = _discover_xyz_files(args.path.expanduser())
+
+    if args.out_dir is None:
+        output_root = input_base_dir.parent.resolve()
+        print(f"No --out-dir provided; defaulting to: {output_root}")
+    else:
+        output_root = args.out_dir.expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     batch_log = output_root / "batch-jobs.log"
     _initialize_batch_log(batch_log)
 
     download_destination = args.download_destination.expanduser().resolve()
 
-    xyz_files, _ = _discover_xyz_files(args.path.expanduser())
-
     prepare_cmd = [
         "python",
         str(prepare_orca_py),
         str(args.path.expanduser()),
-        "--cys",
-        str(args.cys),
-        "--his",
-        str(args.his),
         "--out-dir",
         str(output_root),
         "--dry-run",
@@ -341,6 +358,12 @@ def main() -> int:
         prepare_cmd.append("--single")
     elif args.free:
         prepare_cmd.append("--free")
+    elif args.backbone:
+        prepare_cmd.append("--backbone")
+    elif args.xtb_free:
+        prepare_cmd.append("--xtb-free")
+    elif args.xtb_constrained:
+        prepare_cmd.append("--xtb-constrained")
 
     prep_result = _run_command(prepare_cmd)
     if prep_result.returncode != 0:
@@ -448,8 +471,6 @@ def main() -> int:
         input_path=str(args.path.expanduser().resolve()),
         output_root=str(output_root),
         download_destination=str(download_destination),
-        cys=args.cys,
-        his=args.his,
         h_only=optimization_mode == "h-only",
         optimization_mode=optimization_mode,
         postprocess_job_id=postprocess_job_id,

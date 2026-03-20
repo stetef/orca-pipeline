@@ -133,6 +133,10 @@ _ATOMIC_MASSES_AMU = {
     54: 131.293,
 }
 
+_ATOMIC_NUM_TO_SYMBOL = {
+    z: sym[0] + sym[1:].lower() for sym, z in _ATOMIC_SYMBOLS.items()
+}
+
 
 def _atomic_number_from_token(token: str) -> int:
     token = token.strip()
@@ -154,6 +158,13 @@ def _atomic_mass_amu(z: int) -> float:
             f"Unknown atomic mass for Z={z}. Extend _ATOMIC_MASSES_AMU for this element."
         )
     return float(_ATOMIC_MASSES_AMU[z])
+
+
+def _canonical_symbol_from_token(token: str) -> str:
+    z = _atomic_number_from_token(token)
+    if z not in _ATOMIC_NUM_TO_SYMBOL:
+        raise ValueError(f"Missing canonical symbol for atomic number {z}")
+    return _ATOMIC_NUM_TO_SYMBOL[z]
 
 
 def _read_orca_hessian(filename: Path) -> tuple[np.ndarray, int]:
@@ -238,6 +249,142 @@ def _read_xyz(filename: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     )
 
 
+def _select_latest_xyz(run_dir: Path) -> Path:
+    xyz_files = [path for path in run_dir.glob("*.xyz") if path.is_file()]
+    if not xyz_files:
+        raise FileNotFoundError(f"No .xyz files found in {run_dir}")
+
+    # Prefer single-geometry outputs and ignore any prior standardized CORVUS copies.
+    preferred = [
+        path
+        for path in xyz_files
+        if not path.stem.lower().endswith("_trj")
+        and not path.name.startswith("corvus-begin-")
+    ]
+    pool = preferred if preferred else xyz_files
+
+    return max(pool, key=lambda path: (path.stat().st_mtime, path.name))
+
+
+def _write_clean_corvus_xyz(source_xyz: Path, dest_xyz: Path) -> None:
+    lines = source_xyz.read_text(encoding="utf-8").splitlines()
+    if len(lines) < 2:
+        raise ValueError(f"Input does not look like XYZ (missing header lines): {source_xyz}")
+
+    try:
+        natoms = int(lines[0].split()[0])
+    except (IndexError, ValueError) as exc:
+        raise ValueError(f"Invalid XYZ atom count header in {source_xyz}: {lines[0]!r}") from exc
+
+    cleaned = [lines[0].strip(), lines[1].strip()]
+    parsed_atoms = 0
+    for raw in lines[2:]:
+        if parsed_atoms >= natoms:
+            break
+        if not raw.strip():
+            continue
+        main_part = raw.split("#", 1)[0]
+        tokens = main_part.split()
+        if len(tokens) < 4:
+            raise ValueError(f"Invalid atom line in {source_xyz}: {raw!r}")
+        atom_symbol = _canonical_symbol_from_token(tokens[0])
+        cleaned.append("{:<2} {:>12} {:>12} {:>12}".format(atom_symbol, *tokens[1:4]))
+        parsed_atoms += 1
+
+    if parsed_atoms != natoms:
+        raise ValueError(
+            f"XYZ atom count mismatch in {source_xyz}: header={natoms}, parsed={parsed_atoms}"
+        )
+
+    dest_xyz.write_text("\n".join(cleaned) + "\n", encoding="utf-8")
+
+
+def _read_last_xyz_frame(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Read the final XYZ frame as (atomic_numbers, coords_angstrom)."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    i = 0
+    last_atomic_numbers = None
+    last_coords = None
+
+    while i < len(lines):
+        line = lines[i].strip()
+        if not line:
+            i += 1
+            continue
+
+        try:
+            natoms = int(line.split()[0])
+        except (IndexError, ValueError):
+            i += 1
+            continue
+
+        if natoms <= 0:
+            raise ValueError(f"Invalid atom count in XYZ frame ({natoms}) for {path}")
+        if i + 2 + natoms > len(lines):
+            raise ValueError(f"Truncated XYZ frame in {path} near line {i + 1}")
+
+        atom_lines = lines[i + 2 : i + 2 + natoms]
+        atomic_numbers = []
+        coords = []
+        for raw in atom_lines:
+            main_part = raw.split("#", 1)[0]
+            tokens = main_part.split()
+            if len(tokens) < 4:
+                raise ValueError(f"Invalid atom line in {path}: {raw!r}")
+            z = _atomic_number_from_token(tokens[0])
+            x_a, y_a, z_a = map(float, tokens[1:4])
+            atomic_numbers.append(z)
+            coords.append([x_a, y_a, z_a])
+
+        last_atomic_numbers = np.array(atomic_numbers, dtype=int)
+        last_coords = np.array(coords, dtype=float)
+        i = i + 2 + natoms
+
+    if last_atomic_numbers is None or last_coords is None:
+        raise ValueError(f"No XYZ frames parsed from {path}")
+
+    return last_atomic_numbers, last_coords
+
+
+def _validate_latest_trj_matches_corvus_xyz(
+    run_dir: Path, corvus_xyz_path: Path, tolerance_angstrom: float = 1e-4
+) -> None:
+    trj_files = [path for path in run_dir.glob("*_trj.xyz") if path.is_file()]
+    if not trj_files:
+        return
+
+    latest_trj = max(trj_files, key=lambda path: (path.stat().st_mtime, path.name))
+
+    trj_atomic_numbers, trj_coords = _read_last_xyz_frame(latest_trj)
+    xyz_atomic_numbers, xyz_coords = _read_last_xyz_frame(corvus_xyz_path)
+
+    if len(trj_atomic_numbers) != len(xyz_atomic_numbers):
+        raise ValueError(
+            "Trajectory/Corvus XYZ atom-count mismatch: "
+            f"{latest_trj.name} has {len(trj_atomic_numbers)}, "
+            f"{corvus_xyz_path.name} has {len(xyz_atomic_numbers)}"
+        )
+    if not np.array_equal(trj_atomic_numbers, xyz_atomic_numbers):
+        raise ValueError(
+            "Trajectory/Corvus XYZ element-order mismatch between "
+            f"{latest_trj.name} and {corvus_xyz_path.name}"
+        )
+
+    max_abs_diff = float(np.max(np.abs(trj_coords - xyz_coords)))
+    if max_abs_diff > tolerance_angstrom:
+        raise ValueError(
+            "Trajectory/Corvus XYZ coordinate mismatch: "
+            f"max|delta|={max_abs_diff:.6e} A exceeds tolerance {tolerance_angstrom:.1e} A "
+            f"(trj={latest_trj.name}, corvus={corvus_xyz_path.name})"
+        )
+
+    print(
+        "Validated trajectory consistency: "
+        f"{latest_trj.name} (last frame) matches {corvus_xyz_path.name} "
+        f"within {tolerance_angstrom:.1e} A"
+    )
+
+
 def _print_atom_pair_blocks(hessian: np.ndarray, natoms: int, stream=None) -> None:
     if stream is None:
         stream = sys.stdout
@@ -306,12 +453,18 @@ def _copy_and_replace_qsub(template_path: Path, dest_path: Path, run_dir: Path, 
 
 
 def _copy_and_replace_corvus(
-    template_path: Path, dest_path: Path, run_dir: Path, run_id: str, num_procs: str
+    template_path: Path,
+    dest_path: Path,
+    run_dir: Path,
+    run_id: str,
+    num_procs: str,
+    xyz_filename: str,
 ) -> None:
     content = template_path.read_text(encoding="utf-8")
     content = content.replace("[DIRECTORY]", f"{run_dir}/")
     content = content.replace("[ID]", run_id)
     content = content.replace("[PROCS]", str(num_procs))
+    content = content.replace("[XYZ_FILE]", xyz_filename)
     dest_path.write_text(content, encoding="utf-8")
 
 
@@ -338,13 +491,17 @@ def main() -> int:
         raise FileNotFoundError(f"Missing corvus-qsub.script at {qsub_template_path}")
 
     hess_path = run_dir / f"{run_id}.hess"
-    xyz_path = run_dir / f"{run_id}.xyz"
+    source_xyz_path = _select_latest_xyz(run_dir)
+    xyz_path = run_dir / f"corvus-begin-{run_id}.xyz"
     dym_path = run_dir / f"{run_id}.dym"
 
     if not hess_path.exists():
         raise FileNotFoundError(f"Missing Hessian file: {hess_path}")
-    if not xyz_path.exists():
-        raise FileNotFoundError(f"Missing XYZ file: {xyz_path}")
+
+    _write_clean_corvus_xyz(source_xyz_path, xyz_path)
+    print(f"Selected source XYZ: {source_xyz_path.name}")
+    print(f"Wrote standardized CORVUS XYZ: {xyz_path.name}")
+    _validate_latest_trj_matches_corvus_xyz(run_dir, xyz_path)
 
     hess, natoms_hess = _read_orca_hessian(hess_path)
     atomic_numbers, masses_amu, coords_bohr = _read_xyz(xyz_path)
@@ -373,7 +530,14 @@ def main() -> int:
 
     num_procs = int(os.environ.get('PBS_NUM_PPN', '16'))
     corvus_in_dest = run_dir / f"corvus-{run_id}.in"
-    _copy_and_replace_corvus(corvus_template_path, corvus_in_dest, run_dir, run_id, num_procs)
+    _copy_and_replace_corvus(
+        corvus_template_path,
+        corvus_in_dest,
+        run_dir,
+        run_id,
+        num_procs,
+        xyz_path.name,
+    )
 
     qsub_dest = run_dir / "corvus-qsub.script"
     _copy_and_replace_qsub(qsub_template_path, qsub_dest, run_dir, run_id)

@@ -18,43 +18,235 @@ TEMPLATE_FILE_BY_MODE = {
     "h-only": "orca-template-h-only.in",
     "single-point": "orca-template-single-point.in",
     "no-constraints": "orca-template-no-constraints.in",
+    "backbone": "orca-template-backbone-charges.in",
+    "xtb-free": "orca-template-xtb-free.in",
+    "xtb-constrained": "orca-template-xtb-constrained.in",
 }
 
 
-def get_charge_multiplicity(cys, his):
-    """
-    Get charge and multiplicity based on cysteine and histidine counts.
-    His = 54e, Cys = 34e, Zn = 28e, Water = 10e -> all even
-    Thus no matter what, 2S + 1 = odd = 1
-    """
-    lookup = {
-        (4, 0): (-2, 1),  # (cys, his) : (charge, mult)
-        (3, 1): (-1, 1),
-        (2, 2): (0, 1),
-        (1, 3): (1, 1),
-        (0, 4): (2, 1),
-    }
-    return lookup.get((cys, his), (None, None))
+def extract_charge_multiplicity(xyz_file):
+    """Extract CHARGE_ROUNDED and MULTIPLICITY from XYZ header line 2."""
+    try:
+        lines = Path(xyz_file).read_text().splitlines()
+    except FileNotFoundError:
+        return None, None
+
+    if len(lines) < 2:
+        return None, None
+
+    header = lines[1]
+    charge_match = re.search(r"\bCHARGE_ROUNDED=([-+]?\d+)\b", header)
+    mult_match = re.search(r"\bMULTIPLICITY=(\d+)\b", header)
+
+    if not charge_match or not mult_match:
+        return None, None
+
+    return int(charge_match.group(1)), int(mult_match.group(1))
 
 
-def extract_ca_atoms(comments_file):
-    """Extract CA atom numbers from comments file."""
-    ca_atoms = []
-    
+def extract_ca_atoms(comments_file, atom_type=None, coord=None):
+    """Extract atom numbers from comments file filtered by ATOM and COORD tags."""
+    atom_numbers = []
+
     if not os.path.exists(comments_file):
         print(f"Warning: Comments file not found: {comments_file}")
-        return ca_atoms
-    
+        return atom_numbers
+
+    atom_type_filter = atom_type.upper() if atom_type else None
+    coord_filter = None if coord is None else str(bool(coord)).upper()
+
     with open(comments_file, 'r') as f:
         for line in f:
-            if 'ATOM=CA' in line:
-                # Extract atom number from "Atom 18: " format
-                parts = line.split()
-                if len(parts) >= 2 and parts[0] == 'Atom':
-                    atom_num = parts[1].rstrip(':')
-                    ca_atoms.append(atom_num)
-    
-    return ca_atoms
+            # Extract atom number from "Atom 18: " format
+            parts = line.split()
+            if len(parts) < 2 or parts[0] != 'Atom':
+                continue
+
+            atom_match = re.search(r"\bATOM=([^\s#]+)", line, re.IGNORECASE)
+            coord_match = re.search(r"\bCOORD=(TRUE|FALSE)", line, re.IGNORECASE)
+
+            if atom_type_filter:
+                if not atom_match or atom_match.group(1).upper() != atom_type_filter:
+                    continue
+
+            if coord_filter is not None:
+                if not coord_match or coord_match.group(1).upper() != coord_filter:
+                    continue
+
+            atom_num = parts[1].rstrip(':')
+            atom_numbers.append(atom_num)
+
+    return atom_numbers
+
+
+def extract_h_bonded_atoms(comments_file, bonded_atom_types=None, coord=None):
+    """Extract H atom indices filtered by BONDEDATOM and COORD tags."""
+    atom_numbers = []
+
+    if not os.path.exists(comments_file):
+        print(f"Warning: Comments file not found: {comments_file}")
+        return atom_numbers
+
+    bonded_type_filter = None
+    if bonded_atom_types:
+        bonded_type_filter = {str(atom).upper() for atom in bonded_atom_types}
+    coord_filter = None if coord is None else str(bool(coord)).upper()
+
+    with open(comments_file, 'r') as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) < 2 or parts[0] != 'Atom':
+                continue
+
+            atom_match = re.search(r"\bATOM=([^\s#]+)", line, re.IGNORECASE)
+            if not atom_match or atom_match.group(1).upper() != "H":
+                continue
+
+            if coord_filter is not None:
+                coord_match = re.search(r"\bCOORD=(TRUE|FALSE)", line, re.IGNORECASE)
+                if not coord_match or coord_match.group(1).upper() != coord_filter:
+                    continue
+
+            if bonded_type_filter is not None:
+                bonded_match = re.search(r"\bBONDEDATOM=([^\s#]+)", line, re.IGNORECASE)
+                if not bonded_match or bonded_match.group(1).upper() not in bonded_type_filter:
+                    continue
+
+            atom_num = parts[1].rstrip(':')
+            atom_numbers.append(atom_num)
+
+    return atom_numbers
+
+
+def _format_index_ranges(indices):
+    """Format sorted indices as space-separated contiguous start:end ranges."""
+    if not indices:
+        return ""
+
+    ranges = []
+    start = prev = indices[0]
+    for idx in indices[1:]:
+        if idx == prev + 1:
+            prev = idx
+            continue
+        if start == prev:
+            ranges.append(f"{{{start}}}")
+        else:
+            ranges.append(f"{{{start}:{prev}}}")
+        start = prev = idx
+    if start == prev:
+        ranges.append(f"{{{start}}}")
+    else:
+        ranges.append(f"{{{start}:{prev}}}")
+    return " ".join(ranges)
+
+
+def _extract_comment_atom_metadata(line):
+    """Parse atom index and key metadata tags from one comments-file line."""
+    parts = line.split()
+    if len(parts) < 2 or parts[0] != 'Atom':
+        return None
+
+    try:
+        atom_idx = int(parts[1].rstrip(':'))
+    except ValueError:
+        return None
+
+    coord_match = re.search(r"\bCOORD=(TRUE|FALSE)", line, re.IGNORECASE)
+    atom_match = re.search(r"\bATOM=([^\s#]+)", line, re.IGNORECASE)
+    bonded_match = re.search(r"\bBONDEDATOM=([^\s#]+)", line, re.IGNORECASE)
+
+    coord_value = coord_match.group(1).upper() if coord_match else None
+    atom_value = atom_match.group(1).upper() if atom_match else None
+    bonded_value = bonded_match.group(1).upper() if bonded_match else None
+
+    return atom_idx, coord_value, atom_value, bonded_value
+
+
+def get_xtb_qm_indices(comments_file, include_nco_groups):
+    """Return XTB QMATOMS [INDICES] based on COORD/ATOM/BONDEDATOM rules."""
+    if not os.path.exists(comments_file):
+        print(f"Warning: Comments file not found: {comments_file}")
+        return None
+
+    selected_indices = []
+    nco = {"N", "C", "O", "CA"}
+
+    with open(comments_file, 'r') as f:
+        for line in f:
+            metadata = _extract_comment_atom_metadata(line)
+            if metadata is None:
+                continue
+
+            atom_idx, coord_value, atom_value, bonded_value = metadata
+            if coord_value != "TRUE":
+                continue
+
+            in_nco_group = atom_value in nco or bonded_value in nco
+            if include_nco_groups or not in_nco_group:
+                selected_indices.append(atom_idx)
+
+    if not selected_indices:
+        return None
+
+    return _format_index_ranges(sorted(set(selected_indices)))
+
+
+def get_xtb_constrained_atoms(comments_file):
+    """Return atoms to freeze for xtb-constrained mode."""
+    if not os.path.exists(comments_file):
+        print(f"Warning: Comments file not found: {comments_file}")
+        return []
+
+    selected = []
+    seen = set()
+    nco = {"N", "C", "O", "CA"}
+
+    with open(comments_file, 'r') as f:
+        for line in f:
+            metadata = _extract_comment_atom_metadata(line)
+            if metadata is None:
+                continue
+
+            atom_idx, coord_value, atom_value, bonded_value = metadata
+            in_nco_group = atom_value in nco or bonded_value in nco
+
+            should_constrain = (
+                coord_value == "FALSE"
+                or (coord_value == "TRUE" and in_nco_group)
+            )
+
+            if should_constrain and atom_idx not in seen:
+                seen.add(atom_idx)
+                selected.append(str(atom_idx))
+
+    return selected
+
+
+def get_coord_true_nco_atoms(comments_file):
+    """Return atoms where COORD=TRUE and ATOM/BONDEDATOM is N/C/O/CA."""
+    if not os.path.exists(comments_file):
+        print(f"Warning: Comments file not found: {comments_file}")
+        return []
+
+    selected = []
+    seen = set()
+    nco = {"N", "C", "O", "CA"}
+
+    with open(comments_file, 'r') as f:
+        for line in f:
+            metadata = _extract_comment_atom_metadata(line)
+            if metadata is None:
+                continue
+
+            atom_idx, coord_value, atom_value, bonded_value = metadata
+            in_nco_group = atom_value in nco or bonded_value in nco
+
+            if coord_value == "TRUE" and in_nco_group and atom_idx not in seen:
+                seen.add(atom_idx)
+                selected.append(str(atom_idx))
+
+    return selected
 
 
 def clean_xyz_and_comments(input_path, clean_path=None, comments_path=None):
@@ -181,7 +373,7 @@ def generate_orca_qsub_script(template_dir, id_dir, input_filename, basename, np
     return generated_qsub
 
 
-def process_xyz_file(xyz_file, cys, his, template_dir, output_root, dry_run, template_mode):
+def process_xyz_file(xyz_file, template_dir, output_root, dry_run, template_mode):
     """Process a single XYZ file."""
     # Extract ID from full XYZ stem (no truncation at underscores).
     filename = os.path.basename(xyz_file)
@@ -201,6 +393,13 @@ def process_xyz_file(xyz_file, cys, his, template_dir, output_root, dry_run, tem
     shutil.copy2(xyz_file, dest_xyz)
     os.chmod(dest_xyz, 0o644)
     print(f"  Copied {filename} to {id_dir}/")
+
+    if template_mode == "backbone":
+        source_pc = Path(xyz_file).with_suffix(".pc")
+        dest_pc = id_dir / f"{output_base}.pc"
+        shutil.copy2(source_pc, dest_pc)
+        os.chmod(dest_pc, 0o644)
+        print(f"  Copied {source_pc.name} to {id_dir}/ as {dest_pc.name}")
     
     # Clean XYZ and write comments sidecar
     print("  Cleaning XYZ and extracting comments...")
@@ -214,8 +413,14 @@ def process_xyz_file(xyz_file, cys, his, template_dir, output_root, dry_run, tem
     if clean_result is None or comments_result is None:
         print("  Warning: Failed to clean XYZ or write comments file")
     
-    # Get charge and multiplicity
-    charge, multiplicity = get_charge_multiplicity(cys, his)
+    # Get charge and multiplicity from XYZ header
+    charge, multiplicity = extract_charge_multiplicity(xyz_file)
+    if charge is None or multiplicity is None:
+        print(
+            "  Error: Could not parse CHARGE_ROUNDED and MULTIPLICITY from XYZ header "
+            f"(line 2) in: {xyz_file}"
+        )
+        return
     
     # Copy and modify template
     template_file = template_dir / TEMPLATE_FILE_BY_MODE[template_mode]
@@ -233,16 +438,35 @@ def process_xyz_file(xyz_file, cys, his, template_dir, output_root, dry_run, tem
     template_content = template_content.replace('[MULTIPLICITY]', str(multiplicity))
     template_content = template_content.replace('[PDB_ID]', output_base)
     template_content = template_content.replace('[ID_DIR]', str(id_dir))
-    
-    ca_atoms = []
-    if template_mode == "ca-fixed":
-        # Extract CA atoms from comments file
-        comments_file = id_dir / f"{output_base}_comments.txt"
-        ca_atoms = extract_ca_atoms(comments_file)
 
-        # Build CA constraint lines based on [CA_ATOM] placeholder
+    if template_mode in {"xtb-free", "xtb-constrained"}:
+        comments_file = id_dir / f"{output_base}_comments.txt"
+        qm_atoms_spec = get_xtb_qm_indices(
+            comments_file,
+            include_nco_groups=(template_mode == "xtb-constrained"),
+        )
+
+        if qm_atoms_spec is not None:
+            template_content = template_content.replace('[INDICES]', qm_atoms_spec)
+        else:
+            print("  Warning: Could not determine [INDICES] for xtb QMATOMS")
+    
+    constrained_atoms = []
+    if template_mode in {"ca-fixed", "backbone", "xtb-constrained"}:
+        # Extract constrained atoms from comments file
+        comments_file = id_dir / f"{output_base}_comments.txt"
+        if template_mode == "ca-fixed":
+            constrained_atoms = extract_ca_atoms(comments_file, atom_type="CA", coord=True)
+        elif template_mode == "xtb-constrained":
+            constrained_atoms = get_xtb_constrained_atoms(comments_file)
+        elif template_mode == "backbone":
+            constrained_atoms = get_coord_true_nco_atoms(comments_file)
+        else:
+            constrained_atoms = []
+
+        # Build constraint lines based on [CA_ATOM] placeholder
         ca_constraints = []
-        for atom_num in ca_atoms:
+        for atom_num in constrained_atoms:
             constraint_line = f"  {{C {atom_num} C}}  # Freeze all coordinates (X, Y, Z) of atom {atom_num}"
             ca_constraints.append(constraint_line)
 
@@ -260,10 +484,10 @@ def process_xyz_file(xyz_file, cys, his, template_dir, output_root, dry_run, tem
                         replaced_lines.append(line)
                 template_content = "\n".join(replaced_lines)
             else:
-                print("  Warning: No CA atoms found to replace [CA_ATOM]")
+                print("  Warning: No constrained atoms found to replace [CA_ATOM]")
         elif ca_constraints:
             print("  Warning: No [CA_ATOM] placeholder found in template")
-            print(f"  Found {len(ca_constraints)} CA atoms to constrain")
+            print(f"  Found {len(ca_constraints)} atoms to constrain")
     
     # Ensure final newline (some ORCA versions can misread the last line without it)
     if not template_content.endswith("\n"):
@@ -281,8 +505,14 @@ def process_xyz_file(xyz_file, cys, his, template_dir, output_root, dry_run, tem
         print("    Running single-point style template")
     elif template_mode == "no-constraints":
         print("    Running unconstrained optimization template")
+    elif template_mode == "backbone":
+        print("    Running backbone point-charge template")
+    elif template_mode == "xtb-free":
+        print("    Running XTB free template with COORD=TRUE non-CA/N/C/O QM region")
+    elif template_mode == "xtb-constrained":
+        print("    Running XTB constrained template with COORD=TRUE full QM region")
     else:
-        print(f"    CA atoms to freeze: {len(ca_atoms)}")
+        print(f"    CA atoms to freeze: {len(constrained_atoms)}")
     
     # Generate and (optionally) submit qsub script
     nprocs = extract_nprocs(output_file)
@@ -328,13 +558,14 @@ def main():
         description='Process XYZ files for ORCA calculations with specified ligand composition.'
     )
     parser.add_argument('path', type=str, help='Directory containing XYZ files or a single XYZ file')
-    parser.add_argument('--cys', type=int, required=True, help='Number of cysteines')
-    parser.add_argument('--his', type=int, required=True, help='Number of histidines')
-    parser.add_argument('--out-dir', type=str, default=None, help='Output directory for ID folders')
+    parser.add_argument('--out-dir', type=str, default=None, help='Output directory for ID folders (default: parent of input XYZ directory)')
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument('--H', action='store_true', help='Use orca-template-h-only.in')
     mode_group.add_argument('--single', action='store_true', help='Use orca-template-single-point.in')
     mode_group.add_argument('--free', action='store_true', help='Use orca-template-no-constraints.in')
+    mode_group.add_argument('--backbone', action='store_true', help='Use orca-template-backbone-charges.in (requires matching .pc file)')
+    mode_group.add_argument('--xtb-free', action='store_true', help='Use orca-template-xtb-free.in (COORD=TRUE non-CA/N/C/O QM region)')
+    mode_group.add_argument('--xtb-constrained', action='store_true', help='Use orca-template-xtb-constrained.in (COORD=TRUE full QM region with constraints)')
     parser.add_argument('-n', '--dry-run', action='store_true', help='Generate qsub script but skip qsub submission')
 
     args = parser.parse_args()
@@ -346,27 +577,42 @@ def main():
         template_mode = "single-point"
     elif args.free:
         template_mode = "no-constraints"
-    
-    # Validate cys + his = 4
-    if args.cys + args.his != 4:
-        print(f"ERROR: Number of cysteines ({args.cys}) and histidines ({args.his}) must sum to 4!")
-        print(f"Current sum: {args.cys + args.his}")
-        sys.exit(1)
-    
-    # Validate charge/multiplicity combination exists
-    charge, multiplicity = get_charge_multiplicity(args.cys, args.his)
-    if charge is None:
-        print(f"ERROR: Invalid combination of cys={args.cys} and his={args.his}")
-        sys.exit(1)
-    
-    print(f"Configuration: {args.cys} Cys + {args.his} His")
-    print(f"Charge: {charge}, Multiplicity: {multiplicity}")
+    elif args.backbone:
+        template_mode = "backbone"
+    elif args.xtb_free:
+        template_mode = "xtb-free"
+    elif args.xtb_constrained:
+        template_mode = "xtb-constrained"
+
     print(f"Template mode: {template_mode}")
     
     # Get template directory (assume script is in template directory)
     template_dir = Path(__file__).parent.absolute()
     
-    # Determine output root (default to directory where the script is invoked)
+    # Find all XYZ files in the specified directory
+    target_path = Path(args.path)
+    target_path_was_absolute = target_path.is_absolute()
+    if not target_path.exists():
+        print(f"ERROR: Path not found: {target_path}")
+        sys.exit(1)
+
+    target_path_resolved = target_path.resolve()
+
+    if target_path.is_file():
+        if target_path.suffix.lower() != ".xyz":
+            print(f"ERROR: File is not an XYZ file: {target_path}")
+            sys.exit(1)
+        xyz_files = [target_path_resolved]
+        input_base_dir = target_path_resolved.parent
+    else:
+        xyz_files = list(target_path.glob("*.xyz"))
+        input_base_dir = target_path_resolved
+
+        if not xyz_files:
+            print(f"No XYZ files found in {target_path}")
+            sys.exit(0)
+
+    # Determine output root (default to one directory up from input XYZ directory)
     if args.out_dir:
         raw_out_dir = Path(args.out_dir)
         if not raw_out_dir.is_absolute() and str(raw_out_dir).startswith("home/"):
@@ -384,31 +630,9 @@ def main():
                     f"It resolves to: {output_root}"
                 )
     else:
-        output_root = Path.cwd().resolve()
+        output_root = input_base_dir.parent.resolve()
+        print(f"Defaulting --out-dir to parent of input XYZ directory: {output_root}")
     output_root.mkdir(parents=True, exist_ok=True)
-
-    # Find all XYZ files in the specified directory
-    target_path = Path(args.path)
-    target_path_was_absolute = target_path.is_absolute()
-    if not target_path.exists():
-        print(f"ERROR: Path not found: {target_path}")
-        sys.exit(1)
-
-    target_path_resolved = target_path.resolve()
-
-    if target_path.is_file():
-        if target_path.suffix.lower() != ".xyz":
-            print(f"ERROR: File is not an XYZ file: {target_path}")
-            sys.exit(1)
-        xyz_files = [target_path]
-        input_base_dir = target_path_resolved.parent
-    else:
-        xyz_files = list(target_path.glob("*.xyz"))
-        input_base_dir = target_path_resolved
-
-        if not xyz_files:
-            print(f"No XYZ files found in {target_path}")
-            sys.exit(0)
 
     if input_base_dir != output_root:
         output_was_absolute = Path(args.out_dir).is_absolute() if args.out_dir else True
@@ -417,6 +641,14 @@ def main():
             f"input={input_base_dir} ({'absolute' if target_path_was_absolute else 'relative'} path), "
             f"output={output_root} ({'absolute' if output_was_absolute else 'relative'} path)"
         )
+
+    if template_mode == "backbone":
+        missing_pc = [str(x.with_suffix('.pc')) for x in xyz_files if not x.with_suffix('.pc').exists()]
+        if missing_pc:
+            print("ERROR: --backbone requires a matching .pc file for each XYZ input.")
+            for pc in missing_pc:
+                print(f"  Missing: {pc}")
+            sys.exit(1)
     
     print(f"\nFound {len(xyz_files)} XYZ file(s) to process")
     print(f"Output root: {output_root}")
@@ -424,8 +656,6 @@ def main():
     for xyz_file in xyz_files:
         process_xyz_file(
             xyz_file,
-            args.cys,
-            args.his,
             template_dir,
             output_root,
             args.dry_run,

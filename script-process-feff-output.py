@@ -163,7 +163,7 @@ def parse_xyz_atoms(path: Path):
 
 
 def parse_ca_indices_from_comments(path: Path):
-    pattern = re.compile(r"^Atom\s+(\d+):.*\bATOM=CA\b")
+    pattern = re.compile(r"^Atom\s+(\d+):.*\bATOM=CA\b", re.IGNORECASE)
     indices: List[int] = []
     with path.open("r", encoding="utf-8") as handle:
         for raw_line in handle:
@@ -188,7 +188,13 @@ def find_latest_xyz_file(run_root: Path) -> Path:
     xyz_files = [path for path in run_root.glob("*.xyz") if path.is_file()]
     if not xyz_files:
         raise FileNotFoundError(f"No .xyz files found in {run_root}")
-    return max(xyz_files, key=lambda path: path.stat().st_mtime)
+
+    # Prefer single-geometry xyz files over trajectory dumps (e.g. *_trj.xyz).
+    # Trajectories often contain many frames, and parse_xyz_atoms reads only the first frame,
+    # which may not match the FEFF geometry used for ATOMS matching.
+    non_trj = [path for path in xyz_files if not path.stem.lower().endswith("_trj")]
+    pool = non_trj if non_trj else xyz_files
+    return max(pool, key=lambda path: path.stat().st_mtime)
 
 
 def resolve_comments_file(run_root: Path, xyz_path: Path) -> Path:
@@ -196,10 +202,17 @@ def resolve_comments_file(run_root: Path, xyz_path: Path) -> Path:
     if preferred.is_file():
         return preferred
 
+    # Collect candidates from the run root first, then wider fallbacks.
     candidates = [path for path in run_root.glob("*_comments.txt") if path.is_file()]
     if not candidates:
+        candidates = [path for path in run_root.rglob("*_comments.txt") if path.is_file()]
+    if not candidates and run_root.parent.is_dir():
+        candidates = [path for path in run_root.parent.glob("*_comments.txt") if path.is_file()]
+
+    if not candidates:
         raise FileNotFoundError(
-            f"No *_comments.txt file found in {run_root}; cannot determine CA atom indices"
+            "No *_comments.txt file found near "
+            f"{run_root}; cannot determine CA atom indices"
         )
     return max(candidates, key=lambda path: path.stat().st_mtime)
 
@@ -488,7 +501,7 @@ def write_dw_dat(feff_dir: Path):
     return out_path
 
 
-def xftf_larch(k, chi, kmin, kmax, dk, kweight, kstep, rmax_out):
+def xftf_larch(k, chi, kmin, kmax, dk, kweight, kstep, rmax_out, window):
     from larch import Group
     from larch.xafs import xftf
 
@@ -504,7 +517,7 @@ def xftf_larch(k, chi, kmin, kmax, dk, kweight, kstep, rmax_out):
         kweight=kweight,
         kstep=kstep,
         rmax_out=rmax_out,
-        window="hanning",
+        window=window,
         group=grp,
     )
     return grp.r, grp.chir
@@ -573,6 +586,7 @@ def run_for_feff_dir(feff_dir: Path, args: argparse.Namespace):
             kweight=args.kweight,
             kstep=args.kstep,
             rmax_out=args.rmax,
+            window=args.window,
         )
 
         chir_mag = np.abs(chir)
@@ -702,10 +716,12 @@ def process_system_dir(system_dir: Path, args: argparse.Namespace):
 
     chi_src = feff_dir / "chi_R.dat"
     dw_src = feff_dir / "dw.dat"
+    exafs_src = feff_dir / "exafs_K.dat"
 
     copy_if_exists(xyz_src, output_dir / f"{name}.xyz", "xyz")
     copy_if_exists(chi_src, output_dir / f"chi-R-{name}.dat", "chi_R.dat")
     copy_if_exists(dw_src, output_dir / f"dw-{name}.dat", "dw.dat")
+    copy_if_exists(exafs_src, output_dir / f"exafs-k-{name}.dat", "exafs_k.dat")
 
 
 def build_parser():
@@ -740,10 +756,11 @@ def build_parser():
     )
     parser.add_argument("--kmin", type=float, default=3.0)
     parser.add_argument("--kmax", type=float, default=11.0)
-    parser.add_argument("--dk", type=float, default=1.0)
+    parser.add_argument("--dk", type=float, default=3.0)  # dk=1
     parser.add_argument("--kweight", type=int, default=2)
     parser.add_argument("--kstep", type=float, default=0.05)
     parser.add_argument("--rmax", type=float, default=6.0)
+    parser.add_argument("--window", type=str, default="kaiser")  #window="hanning"
     return parser
 
 

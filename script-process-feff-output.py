@@ -531,86 +531,107 @@ def apply_plot_style(ax):
     ax.tick_params(direction="in", width=2, length=8)
 
 
+def resolve_xanes_path(feff_dir: Path) -> Path | None:
+    path = feff_dir / "xanes_K.dat"
+    return path if path.is_file() else None
+
+
+def resolve_exafs_path(feff_dir: Path) -> Path | None:
+    # Accept both legacy and mode-specific filename variants.
+    candidates = [feff_dir / "exafs_K.dat", feff_dir / "exafs_k.dat"]
+    for path in candidates:
+        if path.is_file():
+            return path
+    return None
+
+
 def run_for_feff_dir(feff_dir: Path, args: argparse.Namespace):
-    xanes_path = feff_dir / "xanes_K.dat"
-    exafs_path = feff_dir / "exafs_K.dat"
+    xanes_path = resolve_xanes_path(feff_dir)
+    exafs_path = resolve_exafs_path(feff_dir)
+    if xanes_path is None and exafs_path is None:
+        raise FileNotFoundError(
+            f"No supported FEFF spectra files in {feff_dir} "
+            "(expected one of xanes_K.dat, exafs_K.dat, exafs_k.dat)"
+        )
 
-    if not xanes_path.exists():
-        raise FileNotFoundError(f"Missing file: {xanes_path}")
-    if not exafs_path.exists():
-        raise FileNotFoundError(f"Missing file: {exafs_path}")
+    saved_outputs = []
 
-    x_omega, _, _, x_mu, _, _ = load_feff_table(xanes_path)
-    _, _, ex_k, _, _, ex_chi = load_feff_table(exafs_path)
+    if xanes_path is not None:
+        x_omega, _, _, x_mu, _, _ = load_feff_table(xanes_path)
 
-    fig, ax = plt.subplots(figsize=(8, 6))
-    ax.plot(x_omega, x_mu, lw=2)
-    ax.set_xlabel("Energy (eV)")
-    ax.set_ylabel(r"$\mu$")
-    ax.set_title("XANES")
-    apply_plot_style(ax)
-    fig.tight_layout()
-    xanes_png = feff_dir / "xanes_K.png"
-    fig.savefig(xanes_png, dpi=300)
-    if not args.show:
-        plt.close(fig)
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.plot(x_omega, x_mu, lw=2)
+        ax.set_xlabel("Energy (eV)")
+        ax.set_ylabel(r"$\mu$")
+        ax.set_title("XANES")
+        apply_plot_style(ax)
+        fig.tight_layout()
+        xanes_png = feff_dir / "xanes_K.png"
+        fig.savefig(xanes_png, dpi=300)
+        saved_outputs.append(xanes_png)
+        if not args.show:
+            plt.close(fig)
 
-    fig, ax = plt.subplots(figsize=(8, 6))
-    ax.plot(ex_k, ex_chi, lw=2)
-    ax.set_xlabel(r"$k\ (1/\AA)$")
-    ax.set_ylabel(r"$\chi(k)$")
-    ax.set_title("EXAFS")
-    apply_plot_style(ax)
-    fig.tight_layout()
-    exafs_png = feff_dir / "exafs_K.png"
-    fig.savefig(exafs_png, dpi=300)
-    if not args.show:
-        plt.close(fig)
+    if exafs_path is not None:
+        _, _, ex_k, _, _, ex_chi = load_feff_table(exafs_path)
+
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.plot(ex_k, ex_chi, lw=2)
+        ax.set_xlabel(r"$k\ (1/\AA)$")
+        ax.set_ylabel(r"$\chi(k)$")
+        ax.set_title("EXAFS")
+        apply_plot_style(ax)
+        fig.tight_layout()
+        exafs_png = feff_dir / "exafs_K.png"
+        fig.savefig(exafs_png, dpi=300)
+        saved_outputs.append(exafs_png)
+        if not args.show:
+            plt.close(fig)
 
     dw_dat = write_dw_dat(feff_dir)
 
-    saved_outputs = [xanes_png, exafs_png, dw_dat]
+    saved_outputs.append(dw_dat)
     if not args.skip_fft:
         chi_path = feff_dir / "chi.dat"
         if not chi_path.exists():
-            raise FileNotFoundError(f"Missing file: {chi_path}")
+            print(f"warning: missing chi.dat for FFT step: {chi_path}")
+        else:
+            k, chi = load_chi_dat(chi_path)
 
-        k, chi = load_chi_dat(chi_path)
+            r, chir = xftf_larch(
+                k,
+                chi,
+                kmin=args.kmin,
+                kmax=args.kmax,
+                dk=args.dk,
+                kweight=args.kweight,
+                kstep=args.kstep,
+                rmax_out=args.rmax,
+                window=args.window,
+            )
 
-        r, chir = xftf_larch(
-            k,
-            chi,
-            kmin=args.kmin,
-            kmax=args.kmax,
-            dk=args.dk,
-            kweight=args.kweight,
-            kstep=args.kstep,
-            rmax_out=args.rmax,
-            window=args.window,
-        )
+            chir_mag = np.abs(chir)
+            chir_re = chir.real
+            chir_im = chir.imag
 
-        chir_mag = np.abs(chir)
-        chir_re = chir.real
-        chir_im = chir.imag
+            out_dat = feff_dir / "chi_R.dat"
+            header = "r  chir_mag  chir_re  chir_im"
+            np.savetxt(out_dat, np.column_stack([r, chir_mag, chir_re, chir_im]), header=header)
+            saved_outputs.append(out_dat)
 
-        out_dat = feff_dir / "chi_R.dat"
-        header = "r  chir_mag  chir_re  chir_im"
-        np.savetxt(out_dat, np.column_stack([r, chir_mag, chir_re, chir_im]), header=header)
-        saved_outputs.append(out_dat)
+            fig, ax = plt.subplots(figsize=(8, 6))
+            ax.plot(r, chir_mag, lw=2)
+            ax.set_xlabel(r"$R\ (\AA)$")
+            ax.set_ylabel(r"$|\chi(R)|$")
+            ax.set_title("EXAFS FT")
+            apply_plot_style(ax)
+            fig.tight_layout()
 
-        fig, ax = plt.subplots(figsize=(8, 6))
-        ax.plot(r, chir_mag, lw=2)
-        ax.set_xlabel(r"$R\ (\AA)$")
-        ax.set_ylabel(r"$|\chi(R)|$")
-        ax.set_title("EXAFS FT")
-        apply_plot_style(ax)
-        fig.tight_layout()
-
-        out_png = feff_dir / "chi_R.png"
-        fig.savefig(out_png, dpi=300)
-        saved_outputs.append(out_png)
-        if not args.show:
-            plt.close(fig)
+            out_png = feff_dir / "chi_R.png"
+            fig.savefig(out_png, dpi=300)
+            saved_outputs.append(out_png)
+            if not args.show:
+                plt.close(fig)
 
     if args.show:
         plt.show()
@@ -664,7 +685,11 @@ def build_feff_dir_candidates(base: Path) -> List[Path]:
 
 
 def is_feff_dir(path: Path) -> bool:
-    return path.is_dir() and (path / "xanes_K.dat").is_file() and (path / "exafs_K.dat").is_file()
+    return path.is_dir() and (
+        (path / "xanes_K.dat").is_file()
+        or (path / "exafs_K.dat").is_file()
+        or (path / "exafs_k.dat").is_file()
+    )
 
 
 def find_feff_dir_in_tree(base: Path) -> Path | None:
@@ -745,7 +770,7 @@ def process_system_dir(system_dir: Path, args: argparse.Namespace):
     if feff_dir is None:
         raise FileNotFoundError(
             f"Could not locate FEFF directory under {system_dir}. "
-            "Expected xanes_K.dat and exafs_K.dat."
+            "Expected at least one of xanes_K.dat, exafs_K.dat, or exafs_k.dat."
         )
 
     run_for_feff_dir(feff_dir, args)
@@ -755,7 +780,7 @@ def process_system_dir(system_dir: Path, args: argparse.Namespace):
 
     chi_src = feff_dir / "chi_R.dat"
     dw_src = feff_dir / "dw.dat"
-    exafs_src = feff_dir / "exafs_K.dat"
+    exafs_src = resolve_exafs_path(feff_dir) or (feff_dir / "exafs_K.dat")
 
     copy_if_exists(xyz_src, output_dir / f"{name}.xyz", "xyz")
     copy_if_exists(chi_src, output_dir / f"chi-R-{name}.dat", "chi_R.dat")
@@ -816,7 +841,7 @@ def main() -> int:
     if not targets:
         print(
             f"error: no processable directories found under {parent_dir}. "
-            "Expected working/output dirs or FEFF working files."
+            "Expected working/output dirs or FEFF files (xanes_K.dat, exafs_K.dat, exafs_k.dat)."
         )
         return 2
 

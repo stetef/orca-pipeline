@@ -1,6 +1,6 @@
 # Set target to feffXANES (we will later change this to XANES).
 target_list { cfavg }
-cfavg_target{ xas }
+cfavg_target{ exafs }
 feff.debye{10.0   315.0  5 corvus-[ID].dym  16  0  3}
 #write_input_only{ True }
 #usesaved{ True }
@@ -60,7 +60,7 @@ feff.fms{9.0 0 0 0.0 0.0 40.0}
 
 # Max path length in EXAFS calculations. Probably could be set to 7 or 8 without any serious change to chi(r), but
 # may need this long path length for low k when interpolating to the XANES calculation.
-feff.rpath{9.0}
+feff.rpath{5.0}
 
 # Make sure we have the right self-energy model.
 feff.exchange{ 0 0.0 0.0 0 }

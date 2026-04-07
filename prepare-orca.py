@@ -14,18 +14,18 @@ from pathlib import Path
 
 
 TEMPLATE_FILE_BY_MODE = {
-    "ca-fixed": "orca-template-ca-fixed.in",
-    "h-only": "orca-template-h-only.in",
-    "single-point": "orca-template-single-point.in",
-    "no-constraints": "orca-template-no-constraints.in",
-    "backbone": "orca-template-backbone-charges.in",
-    "xtb-free": "orca-template-xtb-free.in",
-    "xtb-constrained": "orca-template-xtb-constrained.in",
+    "ca-fixed": "orca-templates/orca-template-ca-fixed.in",
+    "h-only": "orca-templates/orca-template-h-only.in",
+    "single-point": "orca-templates/orca-template-single-point.in",
+    "no-constraints": "orca-templates/orca-template-no-constraints.in",
+    "backbone": "orca-templates/orca-template-backbone-charges.in",
+    "xtb-free": "orca-templates/orca-template-xtb-free.in",
+    "xtb-constrained": "orca-templates/orca-template-xtb-constrained.in",
 }
 
 
 def extract_charge_multiplicity(xyz_file):
-    """Extract CHARGE_ROUNDED and MULTIPLICITY from XYZ header line 2."""
+    """Extract charge and multiplicity from XYZ header line 2."""
     try:
         lines = Path(xyz_file).read_text().splitlines()
     except FileNotFoundError:
@@ -35,7 +35,7 @@ def extract_charge_multiplicity(xyz_file):
         return None, None
 
     header = lines[1]
-    charge_match = re.search(r"\bCHARGE_ROUNDED=([-+]?\d+)\b", header)
+    charge_match = re.search(r"\b(?:CHARGE_ROUNDED|ROUNDED_CHARGE)=([-+]?\d+)\b", header)
     mult_match = re.search(r"\bMULTIPLICITY=(\d+)\b", header)
 
     if not charge_match or not mult_match:
@@ -417,7 +417,7 @@ def process_xyz_file(xyz_file, template_dir, output_root, dry_run, template_mode
     charge, multiplicity = extract_charge_multiplicity(xyz_file)
     if charge is None or multiplicity is None:
         print(
-            "  Error: Could not parse CHARGE_ROUNDED and MULTIPLICITY from XYZ header "
+            "  Error: Could not parse CHARGE_ROUNDED/ROUNDED_CHARGE and MULTIPLICITY from XYZ header "
             f"(line 2) in: {xyz_file}"
         )
         return

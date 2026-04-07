@@ -4,9 +4,6 @@
 # High level is all coordinating atoms, including CA/N/C/O
 %QMMM QMATOMS [INDICES] END END
 
-# Do frequency calculation (produce .hess file)
-! AnFreq
-
 ! 6-311++G(d,p)
 ! ZORA ZORA-def2-TZVP SARC/J
 

@@ -11,10 +11,28 @@ module load openmpi/4.0.5-gcc-8.3.1
 # Pass PBS_NUM_PPN to the corvus template
 export NUM_PROCS=${PBS_NUM_PPN:-16}  # fallback to 16 if not set
 
-mkdir -p "$PWD/Corvus3_cfavg_xas/Corvus1Zn_FEFF"
-cp -f [directory]corvus-[ID].dym "$PWD/Corvus3_cfavg_xas/Corvus1Zn_FEFF/corvus-[ID].dym"
+input_file="[directory]corvus-[ID].in"
 
-"$HOME/.conda/envs/corvusenv/bin/run-corvus" -i [directory]corvus-[ID].in >& [directory]corvus-[ID].out
+shopt -s nocasematch
+corvus_mode=""
+while IFS= read -r line; do
+	if [[ $line =~ cfavg_target[[:space:]]*\{[[:space:]]*(xas|exafs)[[:space:]]*\} ]]; then
+		corvus_mode="${BASH_REMATCH[1],,}"
+		break
+	fi
+done < "$input_file"
+shopt -u nocasematch
+
+if [[ -z "$corvus_mode" ]]; then
+	echo "error: could not determine cfavg_target mode from $input_file" >&2
+	exit 2
+fi
+
+feff_dir="$PWD/Corvus3_cfavg_${corvus_mode}/Corvus1Zn_FEFF"
+mkdir -p "$feff_dir"
+cp -f "[directory]corvus-[ID].dym" "$feff_dir/corvus-[ID].dym"
+
+"$HOME/.conda/envs/corvusenv/bin/run-corvus" -i "$input_file" >& [directory]corvus-[ID].out
 run_status=$?
 echo "run-corvus exit code: $run_status"
 exit $run_status

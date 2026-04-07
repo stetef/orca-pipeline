@@ -619,26 +619,65 @@ def run_for_feff_dir(feff_dir: Path, args: argparse.Namespace):
             print(f"Saved: {out_path}")
 
 
+def parse_cfavg_mode_from_input(input_path: Path) -> str | None:
+    pattern = re.compile(r"cfavg_target\s*\{\s*(xas|exafs)\s*\}", re.IGNORECASE)
+    try:
+        text = input_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+    match = pattern.search(text)
+    if match is None:
+        return None
+    return match.group(1).lower()
+
+
+def detect_cfavg_modes(base: Path) -> List[str]:
+    if not base.is_dir():
+        return []
+
+    modes: List[str] = []
+    seen = set()
+    search_roots = [base] + [
+        child for child in base.iterdir() if child.is_dir() and child.name.startswith("working")
+    ]
+
+    for root in search_roots:
+        for pattern in ("corvus-*.in", "*.in"):
+            for input_path in sorted(root.glob(pattern)):
+                mode = parse_cfavg_mode_from_input(input_path)
+                if mode and mode not in seen:
+                    seen.add(mode)
+                    modes.append(mode)
+
+    return modes
+
+
+def build_feff_dir_candidates(base: Path) -> List[Path]:
+    preferred_modes = detect_cfavg_modes(base)
+    ordered_modes = preferred_modes + [
+        mode for mode in ("xas", "exafs") if mode not in preferred_modes
+    ]
+    return [base] + [
+        base / f"Corvus3_cfavg_{mode}" / "Corvus1Zn_FEFF" for mode in ordered_modes
+    ]
+
+
 def is_feff_dir(path: Path) -> bool:
     return path.is_dir() and (path / "xanes_K.dat").is_file() and (path / "exafs_K.dat").is_file()
 
 
 def find_feff_dir_in_tree(base: Path) -> Path | None:
-    direct_candidates = [
-        base,
-        base / "Corvus3_cfavg_xas" / "Corvus1Zn_FEFF",
-    ]
-    for candidate in direct_candidates:
+    for candidate in build_feff_dir_candidates(base):
         if is_feff_dir(candidate):
             return candidate
 
     for child in base.iterdir() if base.is_dir() else []:
-        if not child.is_dir():
+        if not child.is_dir() or not child.name.startswith("working"):
             continue
-        if child.name.startswith("working") and is_feff_dir(
-            child / "Corvus3_cfavg_xas" / "Corvus1Zn_FEFF"
-        ):
-            return child / "Corvus3_cfavg_xas" / "Corvus1Zn_FEFF"
+        for candidate in build_feff_dir_candidates(child):
+            if is_feff_dir(candidate):
+                return candidate
     return None
 
 

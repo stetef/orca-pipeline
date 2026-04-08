@@ -1,11 +1,12 @@
 #!/bin/bash
-#PBS -l nodes=1:ppn=16
-#PBS -S /bin/bash
-#PBS -N prep-corvus-[RUN_ID]
-#PBS -q workq
-#PBS -V
-#PBS -o prep-corvus-[RUN_ID].sout
-#PBS -e prep-corvus-[RUN_ID].serr
+#SBATCH --partition=milano
+#SBATCH --account=ssrl:SMBXAS
+#SBATCH --nodes=1
+#SBATCH --ntasks=16
+#SBATCH --job-name=prep-corvus-[RUN_ID]
+#SBATCH --output=prep-corvus-[RUN_ID].sout
+#SBATCH --error=prep-corvus-[RUN_ID].serr
+#SBATCH --chdir=.
 
 set -euo pipefail
 
@@ -21,18 +22,18 @@ echo "start_epoch=$start_epoch" > "$timing_file"
 echo "hostname=$(hostname)" >> "$timing_file"
 
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Starting prepare-corvus for $RUN_ID"
-python "$PREP_CORVUS" "$RUN_DIR"
+python "$PREP_CORVUS" "$RUN_DIR" --scheduler [SCHEDULER] --num-procs "${SLURM_NTASKS:-16}"
 
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] prepare-corvus complete; running CORVUS for $RUN_ID"
-if [[ ! -f "$RUN_DIR/corvus-qsub.script" ]]; then
-  echo "Missing generated corvus-qsub.script in $RUN_DIR" >&2
+if [[ ! -f "$RUN_DIR/corvus-job.script" ]]; then
+  echo "Missing generated corvus-job.script in $RUN_DIR" >&2
   exit 2
 fi
 
-# Execute generated corvus script inline (not nested qsub).
-# The generated script uses PBS_O_WORKDIR, so point it to this run directory.
-export PBS_O_WORKDIR="$RUN_DIR"
-bash "$RUN_DIR/corvus-qsub.script"
+# Execute generated corvus script inline (not nested scheduler submission).
+# The generated script uses SLURM_SUBMIT_DIR, so point it to this run directory.
+export SLURM_SUBMIT_DIR="$RUN_DIR"
+bash "$RUN_DIR/corvus-job.script"
 
 run_status=$?
 end_epoch=$(date +%s)

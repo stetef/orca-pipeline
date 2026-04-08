@@ -8,6 +8,22 @@ from pathlib import Path
 import numpy as np
 
 
+SCHEDULER_SUBMIT_COMMAND = {
+    "pbs": "qsub",
+    "slurm": "sbatch",
+}
+
+
+def _default_scheduler() -> str:
+    scheduler = os.environ.get("PIPELINE_SCHEDULER", "pbs").strip().lower()
+    if scheduler not in SCHEDULER_SUBMIT_COMMAND:
+        supported = ", ".join(sorted(SCHEDULER_SUBMIT_COMMAND))
+        raise SystemExit(
+            f"Invalid PIPELINE_SCHEDULER={scheduler!r}. Supported values: {supported}"
+        )
+    return scheduler
+
+
 def _resolve_dir(path_str: str) -> Path:
     run_dir = Path(path_str).expanduser().resolve()
     if not run_dir.exists():
@@ -445,7 +461,7 @@ def _write_dym_file(
         _print_atom_pair_blocks(hess, natoms, stream=f)
 
 
-def _copy_and_replace_qsub(template_path: Path, dest_path: Path, run_dir: Path, run_id: str) -> None:
+def _copy_and_replace_job_script(template_path: Path, dest_path: Path, run_dir: Path, run_id: str) -> None:
     content = template_path.read_text(encoding="utf-8")
     content = content.replace("[directory]", f"{run_dir}/")
     content = content.replace("[ID]", run_id)
@@ -476,19 +492,32 @@ def main() -> int:
         "run_dir",
         help="Path to the run directory; its name is used as the run ID.",
     )
+    parser.add_argument(
+        "--scheduler",
+        choices=sorted(SCHEDULER_SUBMIT_COMMAND),
+        default=_default_scheduler(),
+        help="Scheduler backend used for job template lookup (default: pbs).",
+    )
+    parser.add_argument(
+        "--num-procs",
+        type=int,
+        default=16,
+        help="Processor count used to populate [PROCS] in corvus-template.in (default: 16).",
+    )
     args = parser.parse_args()
 
     run_dir = _resolve_dir(args.run_dir)
     run_id = run_dir.name
 
     script_dir = Path(__file__).resolve().parent
+    scheduler_dir = script_dir / f"{args.scheduler}-scripts"
     corvus_template_path = script_dir / "corvus-template.in"
-    qsub_template_path = script_dir / "corvus-qsub.script"
+    job_template_path = scheduler_dir / "corvus-job.script"
 
     if not corvus_template_path.exists():
         raise FileNotFoundError(f"Missing corvus-template.in at {corvus_template_path}")
-    if not qsub_template_path.exists():
-        raise FileNotFoundError(f"Missing corvus-qsub.script at {qsub_template_path}")
+    if not job_template_path.exists():
+        raise FileNotFoundError(f"Missing corvus-job.script at {job_template_path}")
 
     hess_path = run_dir / f"{run_id}.hess"
     source_xyz_path = _select_latest_xyz(run_dir)
@@ -528,7 +557,7 @@ def main() -> int:
     ]
     subprocess.run(dym2feffinp_cmd, check=True, cwd=run_dir)
 
-    num_procs = int(os.environ.get('PBS_NUM_PPN', '16'))
+    num_procs = args.num_procs
     corvus_in_dest = run_dir / f"corvus-{run_id}.in"
     _copy_and_replace_corvus(
         corvus_template_path,
@@ -539,10 +568,11 @@ def main() -> int:
         xyz_path.name,
     )
 
-    qsub_dest = run_dir / "corvus-qsub.script"
-    _copy_and_replace_qsub(qsub_template_path, qsub_dest, run_dir, run_id)
+    job_script_dest = run_dir / "corvus-job.script"
+    _copy_and_replace_job_script(job_template_path, job_script_dest, run_dir, run_id)
 
-    print(f"Job can be submitted with: qsub {run_dir}/corvus-qsub.script")
+    submit_command = SCHEDULER_SUBMIT_COMMAND[args.scheduler]
+    print(f"Job can be submitted with: {submit_command} {run_dir}/corvus-job.script")
     return 0
 
 

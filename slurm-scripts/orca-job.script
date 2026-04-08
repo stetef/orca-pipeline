@@ -1,0 +1,107 @@
+#!/bin/bash
+#SBATCH --partition=milano
+#SBATCH --account=ssrl:SMBXAS
+#SBATCH --nodes=1
+#SBATCH --time=168:00:00
+#SBATCH --ntasks=[NODES]
+#SBATCH --job-name=orca-[BASENAME]
+#SBATCH --output=orca-[BASENAME].sout
+#SBATCH --error=orca-[BASENAME].serr
+#SBATCH --chdir=.
+
+# Load modules
+if [[ -f /etc/profile.d/modules.sh ]]; then
+  # Initialize environment-modules for non-interactive shells
+  source /etc/profile.d/modules.sh
+fi
+
+module purge
+module load slurm
+module list
+
+# Cluster-specific MPI/compiler/runtime paths
+export PATH=/sdf/group/ssrl/sarangi/sw/openmpi/bin:$PATH
+export LD_LIBRARY_PATH=/sdf/group/ssrl/sarangi/sw/openmpi/lib:$LD_LIBRARY_PATH
+export PATH=/sdf/group/ssrl/sarangi/sw/hpcx-v2.19:$PATH
+export LD_LIBRARY_PATH=/sdf/group/ssrl/sarangi/sw/hpcx-v2.19/hcoll/lib:$LD_LIBRARY_PATH
+export OMPI_MCA_coll_hcoll_enable=0
+export OMPI_MCA_osc=^ucx
+export PATH=/sdf/group/epptheory/Programs/gcc-12/bin:$PATH
+export LD_LIBRARY_PATH=/sdf/group/epptheory/Programs/gcc-12/lib:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=/sdf/group/epptheory/Programs/gcc-12/lib64:$LD_LIBRARY_PATH
+
+shopt -s extglob nullglob
+
+export SLURM_SUBMIT_DIR=${SLURM_SUBMIT_DIR:-$PWD}
+export SLURM_SUBMIT_HOST=${SLURM_SUBMIT_HOST:-$(hostname)}
+
+# Reduce UCX verbosity
+export UCX_LOG_LEVEL=error
+
+export ORCA_HOME=/sdf/group/ssrl/sarangi/sw/orca601
+export PATH="$ORCA_HOME:$PATH"
+export LD_LIBRARY_PATH="$ORCA_HOME:$LD_LIBRARY_PATH"
+ORCA_EXEC="$ORCA_HOME/orca"
+if [[ ! -x "$ORCA_EXEC" ]]; then
+  echo "ORCA not found at $ORCA_EXEC" >&2
+  exit 1
+fi
+
+logfile=$SLURM_SUBMIT_DIR/[BASENAME]-orca.log
+tdir=$(mktemp -d "$PWD"/scratch/orca-run-[BASENAME]__XXXXXX)
+
+trap '
+echo "Job terminated from outer space!" >> $logfile
+rm -rf "$tdir"
+exit
+' TERM
+
+cp "$SLURM_SUBMIT_DIR/[INPUT_FILE]" "$tdir"
+for f in "$SLURM_SUBMIT_DIR"/*.gbw "$SLURM_SUBMIT_DIR"/*.pot; do
+  [[ -e "$f" ]] || continue
+  cp "$f" "$tdir"
+done
+cd "$tdir"
+
+# Ensure mpirun exists if module only provides mpiexec
+MPIEXEC=$(command -v mpirun || command -v mpiexec || true)
+if [[ -z "$MPIEXEC" ]]; then
+  echo "mpirun/mpiexec not found in PATH" >> $logfile
+  exit 1
+fi
+MPI_DIR=$(dirname "$MPIEXEC")
+if [[ ! -x "$MPI_DIR/mpirun" && -x "$MPI_DIR/mpiexec" ]]; then
+  mkdir -p "$tdir/mpi-bin"
+  ln -s "$MPI_DIR/mpiexec" "$tdir/mpi-bin/mpirun"
+  export PATH="$tdir/mpi-bin:$MPI_DIR:$PATH"
+  echo "Created mpirun shim -> mpiexec in $tdir/mpi-bin" >> $logfile
+fi
+
+echo "Job started from ${SLURM_SUBMIT_HOST}, running on $(hostname) in $tdir using $ORCA_EXEC" > $logfile
+echo "--- MODULES ---" >> $logfile
+module list 2>> $logfile
+echo "--- MODULE SHOW (slurm) ---" >> $logfile
+module show slurm 2>> $logfile
+echo "--- MPI ---" >> $logfile
+echo "PATH=$PATH" >> $logfile
+which mpirun >> $logfile 2>&1
+which mpiexec >> $logfile 2>&1
+
+start_epoch=$(date +%s)
+echo "start_epoch=$start_epoch" > "$SLURM_SUBMIT_DIR/[BASENAME]-orca.timing"
+echo "hostname=$(hostname)" >> "$SLURM_SUBMIT_DIR/[BASENAME]-orca.timing"
+
+"$ORCA_EXEC" "[INPUT_FILE]" 1>>"$logfile" 2>&1
+orca_status=$?
+end_epoch=$(date +%s)
+elapsed=$((end_epoch - start_epoch))
+echo "end_epoch=$end_epoch" >> "$SLURM_SUBMIT_DIR/[BASENAME]-orca.timing"
+echo "elapsed_seconds=$elapsed" >> "$SLURM_SUBMIT_DIR/[BASENAME]-orca.timing"
+echo "exit_code=$orca_status" >> "$SLURM_SUBMIT_DIR/[BASENAME]-orca.timing"
+if [[ $orca_status -ne 0 ]]; then
+  echo "ORCA exited with code $orca_status" >> "$logfile"
+fi
+
+cp !(*.inp|*.tmp*) "$SLURM_SUBMIT_DIR"/
+rm -rf "$tdir"
+exit $orca_status

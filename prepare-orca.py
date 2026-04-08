@@ -23,6 +23,21 @@ TEMPLATE_FILE_BY_MODE = {
     "xtb-constrained": "orca-templates/orca-template-xtb-constrained.in",
 }
 
+SCHEDULER_SUBMIT_COMMAND = {
+    "pbs": "qsub",
+    "slurm": "sbatch",
+}
+
+
+def _default_scheduler():
+    scheduler = os.environ.get("PIPELINE_SCHEDULER", "pbs").strip().lower()
+    if scheduler not in SCHEDULER_SUBMIT_COMMAND:
+        supported = ", ".join(sorted(SCHEDULER_SUBMIT_COMMAND))
+        raise SystemExit(
+            f"Invalid PIPELINE_SCHEDULER={scheduler!r}. Supported values: {supported}"
+        )
+    return scheduler
+
 
 def extract_charge_multiplicity(xyz_file):
     """Extract charge and multiplicity from XYZ header line 2."""
@@ -36,7 +51,7 @@ def extract_charge_multiplicity(xyz_file):
 
     header = lines[1]
     charge_match = re.search(r"\b(?:CHARGE_ROUNDED|ROUNDED_CHARGE)=([-+]?\d+)\b", header)
-    mult_match = re.search(r"\bMULTIPLICITY=(\d+)\b", header)
+    mult_match = re.search(r"\b(?:MULTIPLICITY|MULT)=(\d+)\b", header)
 
     if not charge_match or not mult_match:
         return None, None
@@ -355,25 +370,26 @@ def extract_nprocs(orcar_input_file):
     return 1
 
 
-def generate_orca_qsub_script(template_dir, id_dir, input_filename, basename, nprocs):
-    """Generate a PBS qsub script from template."""
-    qsub_template = template_dir / "orca-qsub.script"
-    if not qsub_template.exists():
-        print(f"  Error: Qsub template not found: {qsub_template}")
+def generate_orca_job_script(template_root, scheduler, id_dir, input_filename, basename, nprocs):
+    """Generate a scheduler-specific ORCA job script from template."""
+    scheduler_dir = template_root / f"{scheduler}-scripts"
+    job_template = scheduler_dir / "orca-job.script"
+    if not job_template.exists():
+        print(f"  Error: Job template not found: {job_template}")
         return None
 
-    qsub_content = qsub_template.read_text()
-    qsub_content = qsub_content.replace("[NODES]", str(nprocs or 1))
-    qsub_content = qsub_content.replace("[BASENAME]", basename)
-    qsub_content = qsub_content.replace("[INPUT_FILE]", input_filename)
+    job_content = job_template.read_text()
+    job_content = job_content.replace("[NODES]", str(nprocs or 1))
+    job_content = job_content.replace("[BASENAME]", basename)
+    job_content = job_content.replace("[INPUT_FILE]", input_filename)
 
-    generated_qsub = id_dir / f"generated-{basename}-orca.script"
-    generated_qsub.write_text(qsub_content if qsub_content.endswith("\n") else qsub_content + "\n")
-    os.chmod(generated_qsub, 0o755)
-    return generated_qsub
+    generated_job = id_dir / f"generated-{basename}-orca.script"
+    generated_job.write_text(job_content if job_content.endswith("\n") else job_content + "\n")
+    os.chmod(generated_job, 0o755)
+    return generated_job
 
 
-def process_xyz_file(xyz_file, template_dir, output_root, dry_run, template_mode):
+def process_xyz_file(xyz_file, template_dir, output_root, dry_run, template_mode, scheduler):
     """Process a single XYZ file."""
     # Extract ID from full XYZ stem (no truncation at underscores).
     filename = os.path.basename(xyz_file)
@@ -456,7 +472,7 @@ def process_xyz_file(xyz_file, template_dir, output_root, dry_run, template_mode
         # Extract constrained atoms from comments file
         comments_file = id_dir / f"{output_base}_comments.txt"
         if template_mode == "ca-fixed":
-            constrained_atoms = extract_ca_atoms(comments_file, atom_type="CA", coord=True)
+            constrained_atoms = extract_ca_atoms(comments_file, atom_type="CA")
         elif template_mode == "xtb-constrained":
             constrained_atoms = get_xtb_constrained_atoms(comments_file)
         elif template_mode == "backbone":
@@ -514,43 +530,38 @@ def process_xyz_file(xyz_file, template_dir, output_root, dry_run, template_mode
     else:
         print(f"    CA atoms to freeze: {len(constrained_atoms)}")
     
-    # Generate and (optionally) submit qsub script
+    # Generate and (optionally) submit scheduler job script.
     nprocs = extract_nprocs(output_file)
-    generated_qsub = generate_orca_qsub_script(
+    generated_job = generate_orca_job_script(
         template_dir,
+        scheduler,
         id_dir,
         f"{output_base}.in",
         output_base,
         nprocs,
     )
-    if generated_qsub is None:
+    if generated_job is None:
         return
 
-    print(f"  Generated qsub script: {generated_qsub.name}")
+    submit_command = SCHEDULER_SUBMIT_COMMAND[scheduler]
+    print(f"  Generated job script: {generated_job.name}")
     if dry_run:
-        print(f"  Dry run: generated {generated_qsub.name} (qsub skipped)")
+        print(f"  Dry run: generated {generated_job.name} (submission skipped)")
     else:
-        qsub_cmd = [
-            "qsub",
-            "-j",
-            "oe",
-            "-o",
-            f"{generated_qsub.name}.out",
-            generated_qsub.name,
-        ]
-        print("  Submitting with qsub...")
+        submit_cmd = [submit_command, generated_job.name]
+        print(f"  Submitting with {submit_command}...")
         result = subprocess.run(
-            qsub_cmd,
+            submit_cmd,
             cwd=id_dir,
             capture_output=True,
             text=True,
         )
         if result.stdout:
-            print(f"  qsub output:\n{result.stdout}")
+            print(f"  submission output:\n{result.stdout}")
         if result.stderr:
-            print(f"  qsub stderr:\n{result.stderr}")
+            print(f"  submission stderr:\n{result.stderr}")
         if result.returncode != 0:
-            print(f"  Warning: qsub submission failed (exit code {result.returncode})")
+            print(f"  Warning: job submission failed (exit code {result.returncode})")
 
 
 def main():
@@ -566,7 +577,13 @@ def main():
     mode_group.add_argument('--backbone', action='store_true', help='Use orca-template-backbone-charges.in (requires matching .pc file)')
     mode_group.add_argument('--xtb-free', action='store_true', help='Use orca-template-xtb-free.in (COORD=TRUE non-CA/N/C/O QM region)')
     mode_group.add_argument('--xtb-constrained', action='store_true', help='Use orca-template-xtb-constrained.in (COORD=TRUE full QM region with constraints)')
-    parser.add_argument('-n', '--dry-run', action='store_true', help='Generate qsub script but skip qsub submission')
+    parser.add_argument('-n', '--dry-run', action='store_true', help='Generate job script but skip submission')
+    parser.add_argument(
+        '--scheduler',
+        choices=sorted(SCHEDULER_SUBMIT_COMMAND),
+        default=_default_scheduler(),
+        help='Scheduler backend used for templates and submission command (default: pbs)',
+    )
 
     args = parser.parse_args()
 
@@ -585,6 +602,7 @@ def main():
         template_mode = "xtb-constrained"
 
     print(f"Template mode: {template_mode}")
+    print(f"Scheduler: {args.scheduler}")
     
     # Get template directory (assume script is in template directory)
     template_dir = Path(__file__).parent.absolute()
@@ -660,6 +678,7 @@ def main():
             output_root,
             args.dry_run,
             template_mode,
+            args.scheduler,
         )
     
     print("\nProcessing complete!")

@@ -2,27 +2,29 @@
 
 This directory contains template inputs and helper scripts to run ORCA geometry optimizations and then prepare CORVUS/FEFF inputs. The typical flow is:
 
-1) `script-prepare-orca.py` → run ORCA geometry optimization
-2) `script-prepare-corvus.py` → convert ORCA output to FEFF inputs and set up CORVUS
+1) `prepare-orca.py` → run ORCA geometry optimization
+2) `prepare-corvus.py` → convert ORCA output to FEFF inputs and set up CORVUS
 3) `script-process-feff-output.py` → postprocess FEFF output (plots + chi(R) + `dw.dat`)
 
 ## Scripts
 
-`script-prepare-orca.py`
+`prepare-orca.py`
 - Copies ORCA input templates from `orca-templates/` and fills placeholders
 - Cleans XYZ files and writes sidecar comments
 - Generates ORCA input files per structure
-- Generates `generated-<name>-orca.script` from `orca-qsub.script`
-- Use `--dry-run` to skip `qsub` submission
+- Generates `generated-<name>-orca.script` from `<scheduler>-scripts/orca-job.script`
+- Use `--dry-run` to skip job submission
+- Use `--scheduler {pbs,slurm}` to select scheduler templates and submit command
 - Key args: `path`, `--out-dir`, mode flags, `--dry-run`
 - Reads charge/multiplicity from XYZ header line 2 using:
 	- `CHARGE_ROUNDED=<int>` or `ROUNDED_CHARGE=<int>`
 	- `MULTIPLICITY=<int>`
 
-`script-prepare-corvus.py`
+`prepare-corvus.py`
 - Requires ORCA `.hess` output
 - Converts `.hess` → `.dym`, then runs `dym2feffinp` to build FEFF inputs
-- Copies `corvus-template.in` and `corvus-qsub.script` (submit manually)
+- Copies `corvus-template.in` and `<scheduler>-scripts/corvus-job.script` (submit manually)
+- Use `--scheduler {pbs,slurm}` to select job-script template
 - Key args: `path`, `--out-dir`
 
 `script-process-feff-output.py`
@@ -48,16 +50,15 @@ ORCA input templates in `orca-templates/`:
 - `orca-template-quick.in` (available, not selected by default CLI mode flags)
 - `orca-template-ca-fixed-p450.in` (available, not selected by default CLI mode flags)
 
-ORCA qsub template:
-- `orca-qsub.script`
+Scheduler job script templates:
+- `pbs-scripts/orca-job.script`
+- `pbs-scripts/corvus-job.script`
+- `pbs-scripts/corvus-wrapper.script`
+- `pbs-scripts/postprocess-job.script`
+- `slurm-scripts/` (placeholder directory for future Slurm templates)
 
 CORVUS input template:
 - `corvus-template.in`
-
-CORVUS qsub templates:
-- `corvus-qsub.script`
-- `corvus-wrapper-qsub.script`
-- `postprocess-qsub.script`
 
 ## Quick examples
 ```bash

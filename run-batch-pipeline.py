@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Submit an end-to-end ORCA -> CORVUS -> postprocess PBS workflow for a batch.
+"""Submit an end-to-end ORCA -> CORVUS -> postprocess workflow for a batch.
 
 Workflow overview (per structure ID):
 1) Prepare ORCA inputs/scripts with prepare-orca.py (always called with --dry-run)
-2) Submit ORCA qsub job
-3) Submit dependent CORVUS qsub job (afterok on ORCA) that:
+2) Submit ORCA job
+3) Submit dependent CORVUS job (afterok on ORCA) that:
    - runs prepare-corvus.py inside the ORCA run directory
    - fails fast if <ID>.hess is missing (prepare-corvus enforces this)
-   - executes generated corvus-qsub.script inline in the same allocated PBS job
+    - executes generated corvus-job.script inline in the same allocated job
 
 Batch-level postprocess:
-4) Submit one dependent postprocess qsub job (afterok on *all* CORVUS jobs) that runs:
+4) Submit one dependent postprocess job (afterok on *all* CORVUS jobs) that runs:
    - script-extract-orca-compute-times.py
    - script-process-feff-output.py --recursive
    - script-prepare-files-for-download.py
@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -31,6 +32,14 @@ from typing import Iterable
 
 
 JOB_ID_RE = re.compile(r"(?P<id>\d+)(?:\.[^\s]+)?")
+SCHEDULER_SUBMIT_COMMAND = {
+    "pbs": "qsub",
+    "slurm": "sbatch",
+}
+SCHEDULER_TEMPLATE_DIR = {
+    "pbs": "pbs-scripts",
+    "slurm": "slurm-scripts",
+}
 
 
 @dataclass
@@ -50,6 +59,7 @@ class BatchState:
     created_utc: str
     input_path: str
     output_root: str
+    scheduler: str
     download_destination: str
     h_only: bool
     optimization_mode: str
@@ -66,35 +76,58 @@ def _check_executable(name: str) -> None:
         raise RuntimeError(f"Required executable not found in PATH: {name}")
 
 
-def _dependency_debug_command(job_id: str) -> str:
+def _dependency_debug_command(job_id: str, scheduler: str) -> str:
+    if scheduler == "pbs":
+        return (
+            f"tracejob -n 100 {job_id} 2>&1 | "
+            "grep -Ei 'deleted as result of dependency|Dependency on job|Exit_status|Obit'"
+        )
     return (
-        f"tracejob -n 100 {job_id} 2>&1 | "
-        "grep -Ei 'deleted as result of dependency|Dependency on job|Exit_status|Obit'"
+        f"scontrol show job {job_id} && "
+        f"sacct -j {job_id} --format=JobID,State,ExitCode -n"
     )
 
 
-def _append_batch_job_log(log_path: Path, job_name: str, status: str, job_id: str | None = None) -> None:
+def _append_batch_job_log(
+    log_path: Path,
+    scheduler: str,
+    job_name: str,
+    status: str,
+    job_id: str | None = None,
+) -> None:
     if job_id is None:
         line = f"{job_name}\t{status}\n"
     else:
-        dep_cmd = _dependency_debug_command(job_id)
+        dep_cmd = _dependency_debug_command(job_id, scheduler)
         line = f"{job_name}\t{status}\tjob_id={job_id}\tdep_debug=\"{dep_cmd}\"\n"
     with log_path.open("a", encoding="utf-8") as handle:
         handle.write(line)
 
 
-def _initialize_batch_log(log_path: Path) -> None:
+def _initialize_batch_log(log_path: Path, scheduler: str) -> None:
     if not log_path.exists():
+        if scheduler == "pbs":
+            header = (
+                "# Helpful PBS debug commands (replace <JOB_ID>)\n"
+                "# dependency-deletion check:\n"
+                "#   tracejob -n 100 <JOB_ID> 2>&1 | grep -Ei 'deleted as result of dependency|Dependency on job|Exit_status|Obit'\n"
+                "# full tracejob history:\n"
+                "#   tracejob -n 200 <JOB_ID>\n"
+                "# full scheduler history (if enabled):\n"
+                "#   qstat -x -f <JOB_ID>\n"
+            )
+        else:
+            header = (
+                "# Helpful Slurm debug commands (replace <JOB_ID>)\n"
+                "# dependency and state check:\n"
+                "#   scontrol show job <JOB_ID>\n"
+                "# accounting summary:\n"
+                "#   sacct -j <JOB_ID> --format=JobID,State,ExitCode -n\n"
+                "# queue status:\n"
+                "#   squeue -j <JOB_ID>\n"
+            )
         log_path.write_text(
-            "# Helpful PBS debug commands (replace <JOB_ID>)\n"
-            "# dependency-deletion check:\n"
-            "#   tracejob -n 100 <JOB_ID> 2>&1 | grep -Ei 'deleted as result of dependency|Dependency on job|Exit_status|Obit'\n"
-            "# full tracejob history:\n"
-            "#   tracejob -n 200 <JOB_ID>\n"
-            "# full scheduler history (if enabled):\n"
-            "#   qstat -x -f <JOB_ID>\n"
-            "\n"
-            "job_name\tstatus\tjob_id\tdep_debug\n",
+            header + "\njob_name\tstatus\tjob_id\tdep_debug\n",
             encoding="utf-8",
         )
         return
@@ -107,7 +140,7 @@ def _run_command(cmd: list[str], cwd: Path | None = None) -> subprocess.Complete
     return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
 
 
-def _parse_qsub_job_id(stdout_text: str) -> str:
+def _parse_submitted_job_id(stdout_text: str) -> str:
     for line in stdout_text.splitlines():
         line = line.strip()
         if not line:
@@ -115,7 +148,7 @@ def _parse_qsub_job_id(stdout_text: str) -> str:
         match = JOB_ID_RE.match(line)
         if match:
             return match.group("id")
-    raise ValueError(f"Unable to parse qsub job id from output: {stdout_text!r}")
+    raise ValueError(f"Unable to parse scheduler job id from output: {stdout_text!r}")
 
 
 def _discover_xyz_files(path_arg: Path) -> tuple[list[Path], Path]:
@@ -138,8 +171,15 @@ def _run_id_from_xyz(xyz_file: Path, optimization_mode: str) -> str:
     return f"{base}-H-only" if optimization_mode == "h-only" else base
 
 
-def _write_corvus_wrapper_script(script_path: Path, run_dir: Path, run_id: str, prepare_corvus_py: Path) -> None:
-    template_path = Path(__file__).resolve().parent / "corvus-wrapper-qsub.script"
+def _write_corvus_wrapper_script(
+    script_path: Path,
+    run_dir: Path,
+    run_id: str,
+    prepare_corvus_py: Path,
+    scheduler: str,
+) -> None:
+    script_dir = Path(__file__).resolve().parent
+    template_path = script_dir / SCHEDULER_TEMPLATE_DIR[scheduler] / "corvus-wrapper.script"
     if not template_path.exists():
         raise FileNotFoundError(f"Missing template: {template_path}")
 
@@ -147,6 +187,7 @@ def _write_corvus_wrapper_script(script_path: Path, run_dir: Path, run_id: str, 
     script = script.replace("[RUN_DIR]", str(run_dir))
     script = script.replace("[RUN_ID]", run_id)
     script = script.replace("[PREP_CORVUS]", str(prepare_corvus_py))
+    script = script.replace("[SCHEDULER]", scheduler)
 
     script_path.write_text(script if script.endswith("\n") else script + "\n", encoding="utf-8")
     script_path.chmod(0o755)
@@ -155,6 +196,7 @@ def _write_corvus_wrapper_script(script_path: Path, run_dir: Path, run_id: str, 
 def _write_postprocess_script(
     script_path: Path,
     script_dir: Path,
+    scheduler: str,
     output_root: Path,
     download_destination: Path,
     skip_extract: bool,
@@ -165,7 +207,7 @@ def _write_postprocess_script(
     process_feff_py = script_dir / "script-process-feff-output.py"
     prepare_download_py = script_dir / "script-prepare-files-for-download.py"
 
-    template_path = script_dir / "postprocess-qsub.script"
+    template_path = script_dir / SCHEDULER_TEMPLATE_DIR[scheduler] / "postprocess-job.script"
     if not template_path.exists():
         raise FileNotFoundError(f"Missing template: {template_path}")
 
@@ -196,29 +238,54 @@ def _write_postprocess_script(
     script_path.chmod(0o755)
 
 
-def _submit_job(script_path: Path, cwd: Path, depend_afterok: Iterable[str] | None = None) -> str:
-    cmd = ["qsub"]
+def _submit_job(
+    script_path: Path,
+    cwd: Path,
+    scheduler: str,
+    depend_afterok: Iterable[str] | None = None,
+) -> str:
+    submit_command = SCHEDULER_SUBMIT_COMMAND[scheduler]
+    cmd = [submit_command]
     if depend_afterok:
         dep_expr = "afterok:" + ":".join(str(jobid) for jobid in depend_afterok)
-        cmd.extend(["-W", f"depend={dep_expr}"])
+        if scheduler == "pbs":
+            cmd.extend(["-W", f"depend={dep_expr}"])
+        else:
+            cmd.append(f"--dependency={dep_expr}")
     cmd.append(script_path.name)
 
     result = _run_command(cmd, cwd=cwd)
     if result.returncode != 0:
         raise RuntimeError(
-            f"qsub failed for {script_path} (cwd={cwd})\n"
+            f"{submit_command} failed for {script_path} (cwd={cwd})\n"
             f"stdout:\n{result.stdout}\n"
             f"stderr:\n{result.stderr}"
         )
-    return _parse_qsub_job_id(result.stdout)
+    return _parse_submitted_job_id(result.stdout)
+
+
+def _default_scheduler() -> str:
+    scheduler = os.environ.get("PIPELINE_SCHEDULER", "pbs").strip().lower()
+    if scheduler not in SCHEDULER_SUBMIT_COMMAND:
+        supported = ", ".join(sorted(SCHEDULER_SUBMIT_COMMAND))
+        raise SystemExit(
+            f"Invalid PIPELINE_SCHEDULER={scheduler!r}. Supported values: {supported}"
+        )
+    return scheduler
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Submit ORCA->CORVUS pipeline with PBS dependencies, then submit a final "
+            "Submit ORCA->CORVUS pipeline with scheduler dependencies, then submit a final "
             "batch postprocess job after all CORVUS jobs succeed."
         )
+    )
+    parser.add_argument(
+        "--scheduler",
+        choices=sorted(SCHEDULER_SUBMIT_COMMAND),
+        default=_default_scheduler(),
+        help="Scheduler backend used for templates and submission command.",
     )
     parser.add_argument("path", type=Path, help="XYZ directory or single XYZ file")
     parser.add_argument(
@@ -293,7 +360,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         dest="no_submit",
         action="store_true",
-        help="Generate scripts and state file only; do not qsub",
+        help="Generate scripts and state file only; do not submit",
     )
     return parser
 
@@ -321,8 +388,9 @@ def main() -> int:
         # This pre-check catches missing python early on head/login nodes.
         _check_executable("python")
 
+    submit_command = SCHEDULER_SUBMIT_COMMAND[args.scheduler]
     if not args.no_submit:
-        _check_executable("qsub")
+        _check_executable(submit_command)
 
     script_dir = Path(__file__).resolve().parent
     prepare_orca_py = script_dir / "prepare-orca.py"
@@ -340,7 +408,7 @@ def main() -> int:
         output_root = args.out_dir.expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     batch_log = output_root / "batch-jobs.log"
-    _initialize_batch_log(batch_log)
+    _initialize_batch_log(batch_log, args.scheduler)
 
     download_destination = args.download_destination.expanduser().resolve()
 
@@ -351,6 +419,8 @@ def main() -> int:
         "--out-dir",
         str(output_root),
         "--dry-run",
+        "--scheduler",
+        args.scheduler,
     ]
     if args.H:
         prepare_cmd.append("--H")
@@ -367,13 +437,13 @@ def main() -> int:
 
     prep_result = _run_command(prepare_cmd)
     if prep_result.returncode != 0:
-        _append_batch_job_log(batch_log, "prepare-orca", "FAILED")
+        _append_batch_job_log(batch_log, args.scheduler, "prepare-orca", "FAILED")
         raise RuntimeError(
             "prepare-orca.py failed:\n"
             f"stdout:\n{prep_result.stdout}\n"
             f"stderr:\n{prep_result.stderr}"
         )
-    _append_batch_job_log(batch_log, "prepare-orca", "SUCCEEDED")
+    _append_batch_job_log(batch_log, args.scheduler, "prepare-orca", "SUCCEEDED")
 
     records: list[JobRecord] = []
     for xyz in xyz_files:
@@ -389,33 +459,56 @@ def main() -> int:
                 orca_script = matches[0]
             else:
                 raise FileNotFoundError(
-                    f"Could not locate generated ORCA qsub script in {run_dir}"
+                    f"Could not locate generated ORCA job script in {run_dir}"
                 )
 
         corvus_wrapper = run_dir / f"generated-{run_id}-corvus-wrapper.script"
-        _write_corvus_wrapper_script(corvus_wrapper, run_dir, run_id, prepare_corvus_py)
+        _write_corvus_wrapper_script(
+            corvus_wrapper,
+            run_dir,
+            run_id,
+            prepare_corvus_py,
+            args.scheduler,
+        )
 
         if args.no_submit:
             orca_job_id = "NO_SUBMIT"
             orca_submitted_utc = _utc_now_iso()
             corvus_job_id = "NO_SUBMIT"
             corvus_submitted_utc = _utc_now_iso()
-            _append_batch_job_log(batch_log, f"orca-{run_id}", "SKIPPED")
-            _append_batch_job_log(batch_log, f"corvus-{run_id}", "SKIPPED")
+            _append_batch_job_log(batch_log, args.scheduler, f"orca-{run_id}", "SKIPPED")
+            _append_batch_job_log(batch_log, args.scheduler, f"corvus-{run_id}", "SKIPPED")
         else:
             orca_submitted_utc = _utc_now_iso()
             try:
-                orca_job_id = _submit_job(orca_script, cwd=run_dir)
-                _append_batch_job_log(batch_log, f"orca-{run_id}", "SUCCEEDED", job_id=orca_job_id)
+                orca_job_id = _submit_job(orca_script, cwd=run_dir, scheduler=args.scheduler)
+                _append_batch_job_log(
+                    batch_log,
+                    args.scheduler,
+                    f"orca-{run_id}",
+                    "SUCCEEDED",
+                    job_id=orca_job_id,
+                )
             except Exception:
-                _append_batch_job_log(batch_log, f"orca-{run_id}", "FAILED")
+                _append_batch_job_log(batch_log, args.scheduler, f"orca-{run_id}", "FAILED")
                 raise
             corvus_submitted_utc = _utc_now_iso()
             try:
-                corvus_job_id = _submit_job(corvus_wrapper, cwd=run_dir, depend_afterok=[orca_job_id])
-                _append_batch_job_log(batch_log, f"corvus-{run_id}", "SUCCEEDED", job_id=corvus_job_id)
+                corvus_job_id = _submit_job(
+                    corvus_wrapper,
+                    cwd=run_dir,
+                    scheduler=args.scheduler,
+                    depend_afterok=[orca_job_id],
+                )
+                _append_batch_job_log(
+                    batch_log,
+                    args.scheduler,
+                    f"corvus-{run_id}",
+                    "SUCCEEDED",
+                    job_id=corvus_job_id,
+                )
             except Exception:
-                _append_batch_job_log(batch_log, f"corvus-{run_id}", "FAILED")
+                _append_batch_job_log(batch_log, args.scheduler, f"corvus-{run_id}", "FAILED")
                 raise
 
         records.append(
@@ -435,6 +528,7 @@ def main() -> int:
     _write_postprocess_script(
         postprocess_script,
         script_dir,
+        args.scheduler,
         output_root,
         download_destination,
         skip_extract=args.skip_extract,
@@ -445,19 +539,35 @@ def main() -> int:
     postprocess_job_id: str | None
     if args.no_submit:
         postprocess_job_id = "NO_SUBMIT"
-        _append_batch_job_log(batch_log, f"postprocess-{output_root.name}", "SKIPPED")
+        _append_batch_job_log(
+            batch_log,
+            args.scheduler,
+            f"postprocess-{output_root.name}",
+            "SKIPPED",
+        )
     else:
         corvus_ids = [rec.corvus_job_id for rec in records]
         try:
-            postprocess_job_id = _submit_job(postprocess_script, cwd=output_root, depend_afterok=corvus_ids)
+            postprocess_job_id = _submit_job(
+                postprocess_script,
+                cwd=output_root,
+                scheduler=args.scheduler,
+                depend_afterok=corvus_ids,
+            )
             _append_batch_job_log(
                 batch_log,
+                args.scheduler,
                 f"postprocess-{output_root.name}",
                 "SUCCEEDED",
                 job_id=postprocess_job_id,
             )
         except Exception:
-            _append_batch_job_log(batch_log, f"postprocess-{output_root.name}", "FAILED")
+            _append_batch_job_log(
+                batch_log,
+                args.scheduler,
+                f"postprocess-{output_root.name}",
+                "FAILED",
+            )
             raise
 
     state_file = (
@@ -470,6 +580,7 @@ def main() -> int:
         created_utc=_utc_now_iso(),
         input_path=str(args.path.expanduser().resolve()),
         output_root=str(output_root),
+        scheduler=args.scheduler,
         download_destination=str(download_destination),
         h_only=optimization_mode == "h-only",
         optimization_mode=optimization_mode,

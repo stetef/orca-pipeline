@@ -35,11 +35,11 @@ feff.control{1 1 1 1 1 1}
 feff.rgrid{ 0.01 }
 
 # Set the energy grid. This is serious overkill, but we can optimize easily later.
-feff.egrid{ 
-e_grid -200 -10 20.0
-e_grid -10 10 0.1
-k_grid last 20 0.025
-}
+# feff.egrid{ 
+# e_grid -200 -10 20.0
+# e_grid -10 10 0.1
+# k_grid last 20 0.025
+# }
 
 # Set the muffin-tin overlap of H to 0.8, 1.15 to all others.
 mt_overlap{
@@ -51,16 +51,19 @@ C 1.15
 S 1.15
 }
 
+# Set this to only look at paths max 4 nleg, but might not be built into dmdw
+feff.nleg{4}
+
 # This is used only in the XANES part of the calculation. Useful for creating a combined XAS curve. 
 # Will run much faster if this is removed.
 feff.lfms2{5}
 
 # Setting for XANES part of the calculation. Reduce 9.0 to 3.0 to make this very fast and still get good EXAFS.
-feff.fms{9.0 0 0 0.0 0.0 40.0}
+# feff.fms{9.0 0 0 0.0 0.0 40.0}
 
 # Max path length in EXAFS calculations. Probably could be set to 7 or 8 without any serious change to chi(r), but
 # may need this long path length for low k when interpolating to the XANES calculation.
-feff.rpath{5.0}
+feff.rpath{6.0}
 
 # Make sure we have the right self-energy model.
 feff.exchange{ 0 0.0 0.0 0 }

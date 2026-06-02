@@ -35,7 +35,7 @@ def extract_charge_multiplicity(xyz_file):
         return None, None
 
     header = lines[1]
-    charge_match = re.search(r"\b(?:CHARGE_ROUNDED|ROUNDED_CHARGE)=([-+]?\d+)\b", header)
+    charge_match = re.search(r"\b(?:CHARGE_ROUNDED|ROUNDED_CHARGE|CHARGE)=([-+]?\d+)\b", header)
     mult_match = re.search(r"\bMULTIPLICITY=(\d+)\b", header)
 
     if not charge_match or not mult_match:

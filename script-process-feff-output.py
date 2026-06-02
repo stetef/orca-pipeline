@@ -33,6 +33,28 @@ def load_feff_table(path: Path):
     return omega, energy, k, mu, mu0, chi
 
 
+def load_xmu_columns(path: Path):
+    # FEFF xmu.dat uses the same 6-column numeric layout as other FEFF tables.
+    return load_feff_table(path)
+
+
+def xmu_reports_zero_paths(path: Path) -> bool:
+    pattern = re.compile(r"^#\s*0\s*/\s*0\s+paths\s+used\b", re.IGNORECASE)
+    with path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            if pattern.match(raw_line.strip()):
+                return True
+    return False
+
+
+def ensure_xmu_has_paths(path: Path):
+    if xmu_reports_zero_paths(path):
+        raise ValueError(
+            f"xmu.dat reports 0/0 paths used in {path}. "
+            "This FEFF run produced no scattering paths, so EXAFS/dw parsing cannot proceed."
+        )
+
+
 def load_chi_dat(path: Path):
     data = np.genfromtxt(path, comments="#")
     if data.ndim == 1:
@@ -406,6 +428,7 @@ def write_dw_dat(feff_dir: Path):
     xmu_path = feff_dir / "xmu.dat"
     if not xmu_path.exists():
         raise FileNotFoundError(f"Missing file: {xmu_path}")
+    ensure_xmu_has_paths(xmu_path)
 
     feff_path = resolve_feff_inp_path(feff_dir)
     run_root = feff_path.parent
@@ -417,53 +440,58 @@ def write_dw_dat(feff_dir: Path):
     nearest_atoms = [atom for atom in matched_atoms if atom["distance"] > 1e-8]
     nearest_atoms = sorted(nearest_atoms, key=lambda atom: atom["distance"])[:4]
 
-    latest_xyz = find_latest_xyz_file(run_root)
-    comments_path = resolve_comments_file(run_root, latest_xyz)
-    ca_indices = parse_ca_indices_from_comments(comments_path)
-    xyz_atoms = parse_xyz_atoms(latest_xyz)
-    ca_atoms_by_coords = match_ca_indices_to_feff_atoms(ca_indices, xyz_atoms, atoms)
-
-    matched_by_index = {atom["index"]: atom for atom in matched_atoms}
     ca_atoms = []
-    missing_sig2 = []
     ca_fallback_count = 0
-    for ca_atom in ca_atoms_by_coords:
-        idx = ca_atom["index"]
-        if idx in matched_by_index:
-            with_sig2 = dict(matched_by_index[idx])
-        else:
-            # Fallback: assign by closest nlegs=2 reff when atom-index pairing is ambiguous.
-            fallback = find_sig2_for_distance(
-                nlegs2_entries,
-                ca_atom["distance"],
-                tolerance=0.05,
-                require_within_tolerance=True,
-            )
-            if fallback is None:
+    ca_missing_sig2_count = 0
+    ca_source_note = None
+    ca_skip_reason = None
+
+    try:
+        latest_xyz = find_latest_xyz_file(run_root)
+        comments_path = resolve_comments_file(run_root, latest_xyz)
+        ca_indices = parse_ca_indices_from_comments(comments_path)
+        xyz_atoms = parse_xyz_atoms(latest_xyz)
+        ca_atoms_by_coords = match_ca_indices_to_feff_atoms(ca_indices, xyz_atoms, atoms)
+        ca_source_note = (
+            f"# CA atoms from {comments_path.name}, mapped from Zn-centered "
+            f"{latest_xyz.name} to FEFF ATOMS"
+        )
+
+        matched_by_index = {atom["index"]: atom for atom in matched_atoms}
+        for ca_atom in ca_atoms_by_coords:
+            idx = ca_atom["index"]
+            if idx in matched_by_index:
+                with_sig2 = dict(matched_by_index[idx])
+            else:
+                # Fallback: assign by closest nlegs=2 reff when atom-index pairing is ambiguous.
                 fallback = find_sig2_for_distance(
                     nlegs2_entries,
                     ca_atom["distance"],
                     tolerance=0.05,
-                    require_within_tolerance=False,
+                    require_within_tolerance=True,
                 )
-            if fallback is None:
-                missing_sig2.append(idx)
-                continue
-            with_sig2 = dict(ca_atom)
-            with_sig2.update(fallback)
-            with_sig2["sig2_extrapolated"] = fallback["sig2_match_delta"] > 0.05
-            ca_fallback_count += 1
+                if fallback is None:
+                    fallback = find_sig2_for_distance(
+                        nlegs2_entries,
+                        ca_atom["distance"],
+                        tolerance=0.05,
+                        require_within_tolerance=False,
+                    )
+                if fallback is None:
+                    with_sig2 = dict(ca_atom)
+                    with_sig2["sig2_tot"] = None
+                    ca_missing_sig2_count += 1
+                else:
+                    with_sig2 = dict(ca_atom)
+                    with_sig2.update(fallback)
+                    with_sig2["sig2_extrapolated"] = fallback["sig2_match_delta"] > 0.05
+                    ca_fallback_count += 1
 
-        with_sig2["source_xyz_index"] = ca_atom["source_xyz_index"]
-        with_sig2["match_error"] = ca_atom["match_error"]
-        ca_atoms.append(with_sig2)
-
-    if missing_sig2:
-        missing_str = ", ".join(str(val) for val in sorted(missing_sig2))
-        raise ValueError(
-            "Matched CA atoms in FEFF ATOMS are missing nlegs=2 sig2_tot assignments for "
-            f"atom indices: {missing_str}"
-        )
+            with_sig2["source_xyz_index"] = ca_atom["source_xyz_index"]
+            with_sig2["match_error"] = ca_atom["match_error"]
+            ca_atoms.append(with_sig2)
+    except (FileNotFoundError, ValueError, IndexError) as exc:
+        ca_skip_reason = str(exc)
 
     out_path = feff_dir / "dw.dat"
     with out_path.open("w", encoding="utf-8") as handle:
@@ -477,26 +505,40 @@ def write_dw_dat(feff_dir: Path):
                 f"{atom['distance']:.5f} {atom['sig2_tot']:.5f} {atom['index']}\n"
             )
 
-        handle.write(
-            f"# CA atoms from {comments_path.name}, mapped from Zn-centered {latest_xyz.name} to FEFF ATOMS\n"
-        )
-        if ca_fallback_count:
-            handle.write(
-                "# note: some CA sig2_tot values used nearest available nlegs=2 reff "
-                "because no close nlegs=2 path existed\n"
-            )
-        for atom in ca_atoms:
-            handle.write(
-                "ca "
-                f"{atom['symbol']} {atom['x']:.5f} {atom['y']:.5f} {atom['z']:.5f} "
-                f"{atom['distance']:.5f} {atom['sig2_tot']:.5f} {atom['index']}\n"
-            )
+        if ca_source_note is not None:
+            handle.write(f"{ca_source_note}\n")
+            if ca_fallback_count:
+                handle.write(
+                    "# note: some CA sig2_tot values used nearest available nlegs=2 reff "
+                    "because no close nlegs=2 path existed\n"
+                )
+            if ca_missing_sig2_count:
+                handle.write(
+                    "# note: some CA atoms have no sig2_tot match in nlegs=2 table and are marked as NA\n"
+                )
+            for atom in ca_atoms:
+                sig2_tot = atom.get("sig2_tot", None)
+                sig2_text = f"{sig2_tot:.5f}" if sig2_tot is not None else "NA"
+                handle.write(
+                    "ca "
+                    f"{atom['symbol']} {atom['x']:.5f} {atom['y']:.5f} {atom['z']:.5f} "
+                    f"{atom['distance']:.5f} {sig2_text} {atom['index']}\n"
+                )
+        elif ca_skip_reason is not None:
+            handle.write(f"# CA atoms unavailable: {ca_skip_reason}\n")
 
     if ca_fallback_count:
         print(
             f"warning: assigned nearest nlegs=2 sig2_tot for {ca_fallback_count} CA atom(s) "
             f"in {feff_dir / 'dw.dat'} because close nlegs=2 matches were unavailable"
         )
+    if ca_missing_sig2_count:
+        print(
+            f"warning: {ca_missing_sig2_count} CA atom(s) in {feff_dir / 'dw.dat'} "
+            "have no nlegs=2 sig2_tot match and were written as NA"
+        )
+    if ca_skip_reason is not None:
+        print(f"warning: skipping CA atom section in {feff_dir / 'dw.dat'}: {ca_skip_reason}")
 
     return out_path
 
@@ -545,20 +587,45 @@ def resolve_exafs_path(feff_dir: Path) -> Path | None:
     return None
 
 
+def resolve_xmu_path(feff_dir: Path) -> Path | None:
+    path = feff_dir / "xmu.dat"
+    return path if path.is_file() else None
+
+
+def write_exafs_from_xmu(xmu_path: Path, out_path: Path) -> Path:
+    ensure_xmu_has_paths(xmu_path)
+    _, _, k, _, _, chi = load_xmu_columns(xmu_path)
+    header = "k chi"
+    np.savetxt(out_path, np.column_stack([k, chi]), header=header)
+    return out_path
+
+
 def run_for_feff_dir(feff_dir: Path, args: argparse.Namespace):
     xanes_path = resolve_xanes_path(feff_dir)
     exafs_path = resolve_exafs_path(feff_dir)
+    xmu_path = resolve_xmu_path(feff_dir)
     if xanes_path is None and exafs_path is None:
-        raise FileNotFoundError(
-            f"No supported FEFF spectra files in {feff_dir} "
-            "(expected one of xanes_K.dat, exafs_K.dat, exafs_k.dat)"
+        if xmu_path is None and not (feff_dir / "chi.dat").is_file():
+            raise FileNotFoundError(
+                f"No supported FEFF outputs in {feff_dir} "
+                "(expected one of xanes_K.dat, exafs_K.dat, exafs_k.dat, xmu.dat, chi.dat)"
+            )
+        print(
+            f"warning: no xanes_K.dat/exafs_K.dat/exafs_k.dat in {feff_dir}; "
+            "skipping XANES/EXAFS plotting and continuing with dw.dat/FFT outputs"
         )
 
     saved_outputs = []
 
     if xanes_path is not None:
         x_omega, _, _, x_mu, _, _ = load_feff_table(xanes_path)
+    elif xmu_path is not None:
+        x_omega, _, _, x_mu, _, _ = load_xmu_columns(xmu_path)
+    else:
+        x_omega = None
+        x_mu = None
 
+    if x_omega is not None and x_mu is not None:
         fig, ax = plt.subplots(figsize=(8, 6))
         ax.plot(x_omega, x_mu, lw=2)
         ax.set_xlabel("Energy (eV)")
@@ -574,7 +641,13 @@ def run_for_feff_dir(feff_dir: Path, args: argparse.Namespace):
 
     if exafs_path is not None:
         _, _, ex_k, _, _, ex_chi = load_feff_table(exafs_path)
+    elif xmu_path is not None:
+        _, _, ex_k, _, _, ex_chi = load_xmu_columns(xmu_path)
+    else:
+        ex_k = None
+        ex_chi = None
 
+    if ex_k is not None and ex_chi is not None:
         fig, ax = plt.subplots(figsize=(8, 6))
         ax.plot(ex_k, ex_chi, lw=2)
         ax.set_xlabel(r"$k\ (1/\AA)$")
@@ -685,10 +758,17 @@ def build_feff_dir_candidates(base: Path) -> List[Path]:
 
 
 def is_feff_dir(path: Path) -> bool:
-    return path.is_dir() and (
+    if not path.is_dir():
+        return False
+
+    # Accept both post-processed spectra and raw FEFF outputs.
+    # Some EXAFS runs provide chi/xmu tables but no exafs_K.dat file.
+    return (
         (path / "xanes_K.dat").is_file()
         or (path / "exafs_K.dat").is_file()
         or (path / "exafs_k.dat").is_file()
+        or (path / "xmu.dat").is_file()
+        or (path / "chi.dat").is_file()
     )
 
 
@@ -724,7 +804,8 @@ def resolve_system_targets(parent_dir: Path, recursive: bool) -> List[Path]:
         if not is_process_target(parent_dir):
             raise FileNotFoundError(
                 f"No processing target found in {parent_dir}. "
-                "Expected working/output directories or FEFF working files."
+                "Expected working/output directories or FEFF working files "
+                "(xanes_K.dat, exafs_K.dat, exafs_k.dat, xmu.dat, chi.dat)."
             )
         return [parent_dir]
 
@@ -770,7 +851,8 @@ def process_system_dir(system_dir: Path, args: argparse.Namespace):
     if feff_dir is None:
         raise FileNotFoundError(
             f"Could not locate FEFF directory under {system_dir}. "
-            "Expected at least one of xanes_K.dat, exafs_K.dat, or exafs_k.dat."
+            "Expected FEFF outputs such as xanes_K.dat, exafs_K.dat, exafs_k.dat, "
+            "xmu.dat, or chi.dat."
         )
 
     run_for_feff_dir(feff_dir, args)
@@ -780,11 +862,16 @@ def process_system_dir(system_dir: Path, args: argparse.Namespace):
 
     chi_src = feff_dir / "chi_R.dat"
     dw_src = feff_dir / "dw.dat"
-    exafs_src = resolve_exafs_path(feff_dir) or (feff_dir / "exafs_K.dat")
+    xmu_src = resolve_xmu_path(feff_dir)
+    exafs_src = resolve_exafs_path(feff_dir)
+    if exafs_src is None and xmu_src is not None:
+        exafs_src = write_exafs_from_xmu(xmu_src, feff_dir / "exafs_k_from_xmu.dat")
 
     copy_if_exists(xyz_src, output_dir / f"{name}.xyz", "xyz")
     copy_if_exists(chi_src, output_dir / f"chi-R-{name}.dat", "chi_R.dat")
     copy_if_exists(dw_src, output_dir / f"dw-{name}.dat", "dw.dat")
+    if xmu_src is not None:
+        copy_if_exists(xmu_src, output_dir / f"xmu-{name}.dat", "xmu.dat")
     copy_if_exists(exafs_src, output_dir / f"exafs-k-{name}.dat", "exafs_k.dat")
 
 
@@ -841,7 +928,8 @@ def main() -> int:
     if not targets:
         print(
             f"error: no processable directories found under {parent_dir}. "
-            "Expected working/output dirs or FEFF files (xanes_K.dat, exafs_K.dat, exafs_k.dat)."
+            "Expected working/output dirs or FEFF files "
+            "(xanes_K.dat, exafs_K.dat, exafs_k.dat, xmu.dat, chi.dat)."
         )
         return 2
 

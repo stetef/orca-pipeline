@@ -38,7 +38,7 @@ export SLURM_SUBMIT_HOST=${SLURM_SUBMIT_HOST:-$(hostname)}
 # Reduce UCX verbosity
 export UCX_LOG_LEVEL=error
 
-export ORCA_HOME=/sdf/group/ssrl/sarangi/sw/orca601
+export ORCA_HOME=/sdf/group/ssrl/sarangi/sw/orca601/orca_6_0_1/
 export PATH="$ORCA_HOME:$PATH"
 export LD_LIBRARY_PATH="$ORCA_HOME:$LD_LIBRARY_PATH"
 ORCA_EXEC="$ORCA_HOME/orca"

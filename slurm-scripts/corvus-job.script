@@ -9,7 +9,34 @@
 #SBATCH --chdir=.
 
 cd "${SLURM_SUBMIT_DIR:-$PWD}"
-module load openmpi/4.0.5-gcc-8.3.1
+
+load_openmpi() {
+	local candidates=()
+	if [[ -n "${OPENMPI_MODULE:-}" ]]; then
+		candidates+=("$OPENMPI_MODULE")
+	fi
+	candidates+=(
+		"openmpi/4.0.5-gcc-8.3.1"
+		"openmpi/v4.1.6"
+		"openmpi/v4.1.6-spack"
+		"openmpi/4.1.4rc1-gcc-8.5.0-Mellanox"
+		"mpi/openmpi-x86_64"
+	)
+
+	for mod in "${candidates[@]}"; do
+		if [[ -n "$mod" ]] && module load "$mod" >/dev/null 2>&1; then
+			echo "Loaded MPI module: $mod"
+			return 0
+		fi
+	done
+
+	echo "error: unable to load a supported OpenMPI module." >&2
+	echo "Set OPENMPI_MODULE to a valid module name if needed." >&2
+	module avail 2>&1 | grep -i openmpi >&2 || true
+	return 1
+}
+
+load_openmpi || exit 127
 
 # Pass Slurm task count to the corvus template.
 export NUM_PROCS=${SLURM_NTASKS:-16}  # fallback to 16 if not set
@@ -35,7 +62,23 @@ feff_dir="$PWD/Corvus3_cfavg_${corvus_mode}/Corvus1Zn_FEFF"
 mkdir -p "$feff_dir"
 cp -f "[directory]corvus-[ID].dym" "$feff_dir/corvus-[ID].dym"
 
-"$HOME/.venv/bin/run-corvus" -i "$input_file" >& [directory]corvus-[ID].out
+CORVUS_RUNNER="${CORVUS_RUNNER:-}"
+if [[ -z "$CORVUS_RUNNER" ]]; then
+	for candidate in "${PIPELINE_ROOT:-}/.venv/bin/run-corvus" "$HOME/.venv/bin/run-corvus" "$HOME/.conda/envs/corvusenv/bin/run-corvus" "$(command -v run-corvus 2>/dev/null || true)"; do
+		if [[ -n "$candidate" && -x "$candidate" ]]; then
+			CORVUS_RUNNER="$candidate"
+			break
+		fi
+	done
+fi
+
+if [[ -z "$CORVUS_RUNNER" ]]; then
+	echo "error: could not find a usable run-corvus executable. Set CORVUS_RUNNER to the full path." >&2
+	exit 127
+fi
+
+echo "Using CORVUS runner: $CORVUS_RUNNER"
+"$CORVUS_RUNNER" -i "$input_file" >& [directory]corvus-[ID].out
 run_status=$?
 echo "run-corvus exit code: $run_status"
 exit $run_status

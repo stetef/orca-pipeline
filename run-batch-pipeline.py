@@ -145,7 +145,8 @@ def _parse_submitted_job_id(stdout_text: str) -> str:
         line = line.strip()
         if not line:
             continue
-        match = JOB_ID_RE.match(line)
+        # Accept both "12345.server" (PBS) and "Submitted batch job 12345" (Slurm).
+        match = JOB_ID_RE.search(line)
         if match:
             return match.group("id")
     raise ValueError(f"Unable to parse scheduler job id from output: {stdout_text!r}")

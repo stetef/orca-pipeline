@@ -13,6 +13,23 @@ set -euo pipefail
 RUN_DIR=[RUN_DIR]
 RUN_ID=[RUN_ID]
 PREP_CORVUS=[PREP_CORVUS]
+export PIPELINE_ROOT=$(cd "$(dirname "$PREP_CORVUS")" && pwd)
+if [[ -d "$PIPELINE_ROOT/.venv/bin" ]]; then
+  export PATH="$PIPELINE_ROOT/.venv/bin:$PATH"
+fi
+
+if [[ -n "${PIPELINE_PYTHON:-}" ]]; then
+  PYTHON_BIN="$PIPELINE_PYTHON"
+elif [[ -x "$PIPELINE_ROOT/.venv/bin/python" ]]; then
+  PYTHON_BIN="$PIPELINE_ROOT/.venv/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON_BIN="$(command -v python3)"
+elif command -v python >/dev/null 2>&1; then
+  PYTHON_BIN="$(command -v python)"
+else
+  echo "No usable Python interpreter found for $PREP_CORVUS" >&2
+  exit 127
+fi
 
 cd "$RUN_DIR"
 
@@ -22,7 +39,9 @@ echo "start_epoch=$start_epoch" > "$timing_file"
 echo "hostname=$(hostname)" >> "$timing_file"
 
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Starting prepare-corvus for $RUN_ID"
-python "$PREP_CORVUS" "$RUN_DIR" --scheduler [SCHEDULER] --num-procs "${SLURM_NTASKS:-16}"
+echo "Using Python interpreter: $PYTHON_BIN"
+"$PYTHON_BIN" --version || true
+"$PYTHON_BIN" "$PREP_CORVUS" "$RUN_DIR" --scheduler [SCHEDULER] --num-procs "${SLURM_NTASKS:-16}"
 
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] prepare-corvus complete; running CORVUS for $RUN_ID"
 if [[ ! -f "$RUN_DIR/corvus-job.script" ]]; then

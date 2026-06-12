@@ -10,17 +10,19 @@
 
 cd "${SLURM_SUBMIT_DIR:-$PWD}"
 
+export PIPELINE_ROOT="[PIPELINE_ROOT]"
+
 load_openmpi() {
 	local candidates=()
 	if [[ -n "${OPENMPI_MODULE:-}" ]]; then
 		candidates+=("$OPENMPI_MODULE")
 	fi
 	candidates+=(
+		"mpi/openmpi-x86_64"
 		"openmpi/4.0.5-gcc-8.3.1"
 		"openmpi/v4.1.6"
 		"openmpi/v4.1.6-spack"
 		"openmpi/4.1.4rc1-gcc-8.5.0-Mellanox"
-		"mpi/openmpi-x86_64"
 	)
 
 	for mod in "${candidates[@]}"; do

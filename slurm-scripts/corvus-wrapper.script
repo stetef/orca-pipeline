@@ -51,8 +51,9 @@ fi
 
 # Execute generated corvus script inline (not nested scheduler submission).
 # The generated script uses SLURM_SUBMIT_DIR, so point it to this run directory.
+# Use bash -l (login shell) so that 'module' is available for load_openmpi.
 export SLURM_SUBMIT_DIR="$RUN_DIR"
-bash "$RUN_DIR/corvus-job.script"
+bash -l "$RUN_DIR/corvus-job.script"
 
 run_status=$?
 end_epoch=$(date +%s)

@@ -25,9 +25,6 @@ feff.chsh{4}
 # Use SCF
 feff.scf{ 9.0 0 100 0.05 0}
 
-# Ramp SCF radius from 3 to final radius (9) to improve convergence and possibly speed up.
-feff.scframp{ 3.0 1 }
-
 # Run all parts of feff
 feff.control{1 1 1 1 1 1}
 

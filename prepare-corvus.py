@@ -466,6 +466,7 @@ def _copy_and_replace_job_script(template_path: Path, dest_path: Path, run_dir: 
     content = template_path.read_text(encoding="utf-8")
     content = content.replace("[directory]", f"{run_dir}/")
     content = content.replace("[ID]", run_id)
+    content = content.replace("[PIPELINE_ROOT]", str(Path(__file__).resolve().parent))
     dest_path.write_text(content, encoding="utf-8")
 
 
@@ -635,7 +636,10 @@ def main() -> int:
         dym2feffinp_bin = _resolve_executable(
             "dym2feffinp",
             "DYM2FEFFINP_BIN",
-            ["/opt/feff10/bin/MPI/dym2feffinp"],
+            [
+                "/opt/feff10/bin/MPI/dym2feffinp",
+                "/sdf/home/t/tetef01/software/feff10-10.0.0/bin/MPI/dym2feffinp",
+            ],
         )
     except FileNotFoundError as exc:
         print(f"{exc}")

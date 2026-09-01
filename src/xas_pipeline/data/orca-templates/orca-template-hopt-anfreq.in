@@ -1,7 +1,6 @@
 ! TightOPT PBE0 D3BJ RIJCOSX def2-TZVP def2/J CPCM(water)
 
-# Do frequency calculation (produce .hess file)
-! AnFreq
+[ANFREQ]
 
 ! 6-311++G(d,p)
 ! ZORA ZORA-def2-TZVP SARC/J
@@ -23,4 +22,4 @@ end
 end
 
 # Use xyz file, first number is charge, second number is multiplicity (2S+1)
-*xyzfile [CHARGE] [MULTIPLICITY] [ID_DIR]/[PDB_ID]_clean.xyz
+*xyzfile [CHARGE] [MULTIPLICITY] [GEOMETRY]

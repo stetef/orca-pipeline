@@ -1,6 +1,6 @@
 ! TightOPT PBE0 D3BJ RIJCOSX def2-TZVP def2/J CPCM(water)
 
-# Hydrogen-only optimization, deliberately with NO "! AnFreq".
+# Hydrogen-only optimization with no analytic frequencies.
 #
 # Heavy atoms stay at their carved (crystallographic) positions; only the protons
 # move. That is the point of this mode: hydrogens in a carved PDB cluster are
@@ -13,9 +13,14 @@
 # The Hessian is NOT computed here. It is interpolated from the packaged ligand
 # spring models by xas_pipeline.stages.interp_hessian, which the corvus wrapper
 # runs before prepare-corvus and which writes the same <run_id>.hess the
-# CORVUS/FEFF stage expects. Adding "! AnFreq" back would spend the
+# CORVUS/FEFF stage expects.
+#
+# [ANFREQ] below is filled by prepare-orca and defaults to OFF for this mode
+# (MODE_ANFREQ_DEFAULT). Forcing it on with --anfreq would spend the
 # analytic-frequency time this mode exists to avoid AND have its .hess
 # immediately overwritten by the interpolated one -- do not "fix" its absence.
+
+[ANFREQ]
 
 ! 6-311++G(d,p)
 ! ZORA ZORA-def2-TZVP SARC/J
@@ -37,4 +42,4 @@ end
 end
 
 # Use xyz file, first number is charge, second number is multiplicity (2S+1)
-*xyzfile [CHARGE] [MULTIPLICITY] [ID_DIR]/[PDB_ID]_clean.xyz
+*xyzfile [CHARGE] [MULTIPLICITY] [GEOMETRY]

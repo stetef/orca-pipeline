@@ -8,6 +8,7 @@ ORCA run: log -> diagnosis (:mod:`xas_pipeline.diagnosis`), diagnosis -> remedy
 
 from __future__ import annotations
 
+import json
 import textwrap
 from pathlib import Path
 
@@ -370,3 +371,91 @@ def test_cli_escalates_to_canonical_channels_not_txt(tmp_path):
     assert len(state["attempts"]) == MAX_ATTEMPTS
     # And surfaced in the canonical batch-jobs.log.
     assert "NEEDS_HUMAN" in (tmp_path / "batch-jobs.log").read_text()
+
+
+# ---------------------------------------------------------------------------
+# Staged runs (prepare-orca --pre)
+# ---------------------------------------------------------------------------
+
+
+def test_opt_restart_full_path_replaces_the_whole_geometry_spec():
+    """A staged stage 2 reads from the PREVIOUS stage's directory.
+
+    Swapping only the basename there would build
+    ``<stage1_dir>/<stage2_run_id>.xyz`` -- a file that does not and will never
+    exist, so the restart would fail on a missing geometry.
+    """
+    from xas_pipeline.input_remedy import _swap_geometry_filename
+
+    line = "*xyzfile -2 1 /batch/id/id-quick-ca-fixed/id-quick-ca-fixed.xyz"
+    swapped = _swap_geometry_filename(line, "/batch/id/id-caopt-anfreq/id-caopt-anfreq.xyz")
+    assert swapped == "*xyzfile -2 1 /batch/id/id-caopt-anfreq/id-caopt-anfreq.xyz"
+
+
+def test_opt_restart_bare_filename_still_keeps_the_existing_directory():
+    """The single-stage behaviour, unchanged."""
+    from xas_pipeline.input_remedy import _swap_geometry_filename
+
+    line = "*xyzfile -2 1 /batch/id/id-caopt-anfreq/id-caopt-anfreq_clean.xyz"
+    swapped = _swap_geometry_filename(line, "id-caopt-anfreq.xyz")
+    assert swapped == "*xyzfile -2 1 /batch/id/id-caopt-anfreq/id-caopt-anfreq.xyz"
+
+
+def test_next_stage_sidecar_is_ignored_when_absent_or_malformed(tmp_path):
+    """A broken sidecar must not stop the rerun of the stage itself."""
+    from xas_pipeline.cli import rerun_orca
+
+    run_dir = tmp_path / "id-quick-ca-fixed"
+    run_dir.mkdir()
+    assert rerun_orca._load_next_stage(run_dir, "id-quick-ca-fixed") is None
+
+    (run_dir / "id-quick-ca-fixed-next-stage.json").write_text("{not json", encoding="utf-8")
+    assert rerun_orca._load_next_stage(run_dir, "id-quick-ca-fixed") is None
+
+    (run_dir / "id-quick-ca-fixed-next-stage.json").write_text("{}", encoding="utf-8")
+    assert rerun_orca._load_next_stage(run_dir, "id-quick-ca-fixed") is None
+
+
+def test_rechain_cancels_the_dead_stage_and_requeues_it_on_the_new_job(tmp_path, monkeypatch):
+    """The scheduler killed the dependent stage when its parent failed; the rerun
+    has to put it back, or a recoverable SCF hiccup silently drops it."""
+    from xas_pipeline import orchestrate as bp
+    from xas_pipeline.cli import rerun_orca
+
+    run_dir = tmp_path / "id-quick-ca-fixed"
+    next_dir = tmp_path / "id-caopt-anfreq"
+    run_dir.mkdir()
+    next_dir.mkdir()
+    (next_dir / "generated-id-caopt-anfreq-orca.script").write_text("#!/bin/bash\n")
+
+    record = {
+        "next_run_id": "id-caopt-anfreq",
+        "next_run_dir": str(next_dir),
+        "next_job_script": "generated-id-caopt-anfreq-orca.script",
+        "next_job_id": "555",
+    }
+    sidecar = run_dir / "id-quick-ca-fixed-next-stage.json"
+    sidecar.write_text(json.dumps(record), encoding="utf-8")
+
+    cancelled: list[str] = []
+    submitted: list[dict] = []
+    monkeypatch.setattr(bp, "_cancel_job", lambda jid, sched: cancelled.append(jid) or True)
+    monkeypatch.setattr(
+        bp, "_submit_job",
+        lambda script, cwd, scheduler, depend_afterok=None, depend_afterany=None: (
+            submitted.append({"script": Path(script).name, "afterok": list(depend_afterok or [])})
+            or "999"
+        ),
+    )
+
+    rerun_orca._rechain_next_stage(
+        run_dir, "id-quick-ca-fixed", dict(record), "888", "slurm",
+        tmp_path / "batch-jobs.log", attempt=1,
+    )
+
+    assert cancelled == ["555"]
+    assert submitted == [
+        {"script": "generated-id-caopt-anfreq-orca.script", "afterok": ["888"]}
+    ]
+    # The sidecar now names the live job, so a second failure cancels the right one.
+    assert json.loads(sidecar.read_text())["next_job_id"] == "999"

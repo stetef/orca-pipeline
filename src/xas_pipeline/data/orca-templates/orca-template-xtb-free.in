@@ -4,8 +4,7 @@
 # High level is all coordinating atoms to CB, excluding CA/N/C/O 
 %QMMM QMATOMS [INDICES] END END
 
-# Do frequency calculation (produce .hess file)
-! AnFreq
+[ANFREQ]
 
 ! 6-311++G(d,p)
 ! ZORA ZORA-def2-TZVP SARC/J
@@ -22,4 +21,4 @@ end
   end
 
 # Use xyz file, first number is charge, second number is multiplicity (2S+1)
-*xyzfile [CHARGE] [MULTIPLICITY] [ID_DIR]/[PDB_ID]_clean.xyz
+*xyzfile [CHARGE] [MULTIPLICITY] [GEOMETRY]

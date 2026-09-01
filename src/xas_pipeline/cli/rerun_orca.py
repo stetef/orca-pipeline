@@ -22,12 +22,18 @@ For one run directory it:
   7) resubmits the ORCA job and a fresh dependent CORVUS job (afterok), so the
      DAG self-heals -- no lingering DependencyNeverSatisfied CORVUS zombie.
 
+For a *pre-stage* of a staged run (``prepare-orca --pre``), step 7 re-chains the
+next ORCA stage instead of CORVUS: the ``<run_id>-next-stage.json`` sidecar names
+the stage that was queued afterok on this one, which the scheduler killed when
+this stage failed. CORVUS belongs after the final stage, not this one.
+
 Submission machinery is reused from :mod:`xas_pipeline.orchestrate`.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import shutil
 from pathlib import Path
@@ -144,6 +150,70 @@ def _cancel_stale_corvus(run_dir: Path, run_id: str, scheduler: str, *, no_submi
     )
 
 
+def _load_next_stage(run_dir: Path, run_id: str) -> dict | None:
+    """The ``<run_id>-next-stage.json`` sidecar prepare-orca --pre leaves, if any.
+
+    Present only on a *pre*-stage of a staged run: it names the ORCA stage that was
+    queued afterok on this one. Unreadable or malformed is treated as absent -- a
+    broken sidecar must not stop the rerun of the stage itself.
+    """
+    path = run_dir / f"{run_id}-next-stage.json"
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print(f"[{run_id}] warning: ignoring unreadable next-stage sidecar: {exc}")
+        return None
+    return data if isinstance(data, dict) and data.get("next_job_script") else None
+
+
+def _rechain_next_stage(
+    run_dir: Path,
+    run_id: str,
+    record: dict,
+    new_orca_job_id: str,
+    scheduler: str,
+    batch_log: Path,
+    attempt: int,
+) -> None:
+    """Re-queue the stage that followed this one onto the resubmitted ORCA job.
+
+    The chain lives only in the scheduler, and it is gone the moment this stage
+    fails: the dependent stage is killed as DependencyNeverSatisfied. Without this
+    a recoverable SCF hiccup in stage 1 would silently drop stage 2 -- the rerun
+    would succeed and nothing would ever consume its geometry.
+    """
+    next_dir = Path(record["next_run_dir"])
+    next_id = record.get("next_run_id") or next_dir.name
+    next_script = next_dir / record["next_job_script"]
+    if not next_script.is_file():
+        print(f"[{run_id}] warning: next stage script missing, not re-chained: {next_script}")
+        return
+
+    stale = record.get("next_job_id")
+    if stale:
+        print(f"[{run_id}] cancelling stale next-stage job {stale} (its parent stage failed)")
+        bp._cancel_job(str(stale), scheduler)
+
+    try:
+        new_id = bp._submit_job(
+            next_script, cwd=next_dir, scheduler=scheduler, depend_afterok=[new_orca_job_id]
+        )
+    except Exception:
+        bp._append_batch_job_log(batch_log, f"orca-stage-rerun{attempt}-{next_id}", "SUBMIT_FAILED")
+        raise
+    bp._append_batch_job_log(
+        batch_log, f"orca-stage-rerun{attempt}-{next_id}", "SUBMITTED", job_id=new_id
+    )
+    print(f"[{run_id}] re-chained next stage {next_id} (afterok:{new_orca_job_id}): {new_id}")
+
+    record["next_job_id"] = new_id
+    (run_dir / f"{run_id}-next-stage.json").write_text(
+        json.dumps(record, indent=2) + "\n", encoding="utf-8"
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -228,7 +298,10 @@ def main() -> int:
     if remedy.opt_restart:
         last_geom = run_dir / f"{run_id}.xyz"
         if last_geom.is_file():
-            last_geometry_name = last_geom.name
+            # Full path, not just the basename: for a staged run (prepare-orca
+            # --pre) the *xyzfile line points at the PREVIOUS stage's directory,
+            # and keeping that directory would name a file that does not exist.
+            last_geometry_name = str(last_geom)
         else:
             print(f"[{run_id}] note: opt-restart requested but {last_geom.name} missing; "
                   "keeping original geometry.")
@@ -290,6 +363,28 @@ def main() -> int:
         except Exception:
             bp._append_batch_job_log(batch_log, f"orca-rerun{attempt}-{run_id}", "SUBMIT_FAILED")
             raise
+
+        # A pre-stage of a staged run feeds the next ORCA stage, not CORVUS.
+        # Re-chain that stage onto the fresh job id and stop -- queueing CORVUS
+        # here would run it on a geometry two stages too early.
+        next_stage = _load_next_stage(run_dir, run_id)
+        if next_stage is not None:
+            _rechain_next_stage(
+                run_dir, run_id, next_stage, orca_job_id, args.scheduler, batch_log, attempt
+            )
+            state.attempts.append(
+                rerun_state.Attempt(
+                    attempt=attempt,
+                    kind=diag.kind.value,
+                    remedy=remedy.label,
+                    utc=bp._utc_now_iso(),
+                    orca_job_id=orca_job_id,
+                    input_backup=str(backup),
+                    note=mem_note,
+                )
+            )
+            rerun_state.save_state(state_file, state)
+            return 0
 
         mode = args.corvus_mode
         wrapper = run_dir / f"generated-{run_id}-corvus-{mode}-wrapper.script"

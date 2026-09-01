@@ -1,6 +1,8 @@
 ! B97-3c CPCM(WATER) OPT PAL16
+
+[ANFREQ]
 # Per-process memory in MB, sized by prepare-orca.py from the atom count
 %maxcore [MAXCORE]
 
 
-*xyzfile [CHARGE] [MULTIPLICITY] [ID_DIR]/[PDB_ID]_clean.xyz
+*xyzfile [CHARGE] [MULTIPLICITY] [GEOMETRY]

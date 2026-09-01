@@ -152,10 +152,68 @@ ended with `-interp`, so a suffix missing from the vocabulary resolved to the wr
 mode silently (302 run dirs). No canonical name is a suffix of another, and a test
 enforces it.
 
+### Staged runs and the AnFreq toggle (`xas-prepare-orca`)
+
+`! AnFreq` is no longer hard-coded in the templates. Every ORCA template carries
+an `[ANFREQ]` placeholder that `prepare-orca` fills from
+`orca_prep.MODE_ANFREQ_DEFAULT` — a per-mode table reproducing exactly what each
+template used to say, so **every mode's default behaviour is unchanged** (a test
+pins the table against the pre-refactor values). `--anfreq` / `--no-anfreq`
+override it for the final stage:
+
+```bash
+# The CA-fixed PBE0 optimization, but skip the (expensive) analytic frequencies:
+xas-prepare-orca xyz_files --out-dir batch --no-anfreq
+```
+
+A `--no-anfreq` run writes no `.hess`, so a CORVUS stage pointed at it later fails
+fast in `prepare-corvus` with a missing-Hessian error. That is intended: the toggle
+buys the geometry, not the Debye-Waller factors.
+
+`--pre MODE` runs a cheaper ORCA stage *first* and starts the next one from its
+optimized geometry, chained `afterok`:
+
+```bash
+# B97-3c CA-fixed pre-optimization, then the PBE0 CA-fixed opt, no frequencies:
+xas-prepare-orca xyz_files --out-dir batch --scheduler slurm \
+    --pre quick-ca-fixed --no-anfreq
+```
+
+- `--pre` is repeatable; stages run in the order given, with the mode selected by
+  the usual flags last.
+- Each stage keeps its **own** `<id>-<mode>` run dir, so every existing scan
+  (`orca_check`, `layout.iter_id_dirs`, the auto-rerun triage) sees it as the
+  ordinary ORCA run it is and can diagnose or rerun it on its own:
+
+```text
+batch/CPA_G_OH_OH/
+  CPA_G_OH_OH-quick-ca-fixed/     <- stage 1, reads <run_id>_clean.xyz
+  CPA_G_OH_OH-caopt-anfreq/       <- stage 2, reads stage 1's <run_id>.xyz
+```
+
+- Stage N+1's `*xyzfile` is an **absolute** path into stage N's dir (the job script
+  runs ORCA from scratch space), naming a file that does not exist yet. The
+  `afterok` dependency is what guarantees it does.
+- **Pre-stages never run AnFreq**, whatever their mode default: their geometry is
+  about to move again, so the Hessian would describe a structure that is
+  discarded. `--anfreq`/`--no-anfreq` therefore always mean "the final stage".
+- A mode may appear only once in a chain (two stages would want one run dir), and
+  `--pre` cannot be combined with a mode that runs no ORCA at all. Both are
+  rejected before anything is written.
+- Each pre-stage writes `<run_id>-next-stage.json` naming what was queued after
+  it. The scheduler forgets the chain the moment a stage fails (the dependent job
+  is killed as `DependencyNeverSatisfied`), so `xas-rerun-orca` reads that sidecar
+  and re-chains the next stage onto the resubmitted job — otherwise a recoverable
+  SCF hiccup in stage 1 would silently drop stage 2.
+
+Both features live in `xas-prepare-orca`. `xas-run-batch` still submits a single
+ORCA stage with its template default, because the CORVUS job it chains would have
+to depend on the *final* stage and be told whether an ORCA Hessian exists at all.
+
 ### `--interp` / `--interp-raw`: Hessian without AnFreq
 
-Both modes skip the analytic-frequency step (their templates deliberately omit
-`! AnFreq`) and get the Hessian CORVUS needs *interpolated* from pre-built
+Both modes skip the analytic-frequency step (`MODE_ANFREQ_DEFAULT` is `False` for
+them) and get the Hessian CORVUS needs *interpolated* from pre-built
 per-ligand spring models instead. They differ only in what happens to the
 geometry first:
 
@@ -406,6 +464,9 @@ xas-prepare-orca <xyz_dir_or_file> --out-dir <batch> --scheduler slurm [--dry-ru
 #           --xtb-constrained --interp --interp-raw
 #    --interp-raw writes no ORCA input or job script at all
 #    run dirs land at <batch>/<id>/<id>-<mode>/
+#    --anfreq / --no-anfreq force "! AnFreq" on/off for the final stage
+#    --pre MODE (repeatable) runs cheaper stages first, chained afterok, each
+#      starting from the previous stage's optimized geometry
 
 # 1b. Only for the interp modes: build <ID>.hess from ligand spring models
 #     (the generated CORVUS wrapper does this automatically)

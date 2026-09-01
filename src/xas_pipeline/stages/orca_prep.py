@@ -4,6 +4,7 @@ Process XYZ files for ORCA calculations with specified ligand composition.
 """
 
 import argparse
+import json
 import math
 import os
 import re
@@ -81,6 +82,53 @@ TEMPLATE_FILE_BY_MODE = {
     "carved-spring": "orca-templates/orca-template-carved-spring.in",
     "hopt-spring": "orca-templates/orca-template-hopt-spring.in",
 }
+
+
+# ---------------------------------------------------------------------------
+# AnFreq toggle
+# ---------------------------------------------------------------------------
+# "! AnFreq" used to be hard-coded in each template, which made "the same
+# optimization, minus the analytic frequencies" reachable only by adding a
+# near-duplicate template. Every registered template now carries an [ANFREQ]
+# placeholder instead, and the keyword is filled in here.
+#
+# MODE_ANFREQ_DEFAULT reproduces, per mode, exactly what its template said before
+# the placeholder was introduced -- so the default behaviour of every mode is
+# unchanged and a test pins that. --anfreq / --no-anfreq override it.
+#
+# It is deliberately an explicit table and not derived from the mode name: the
+# "-anfreq"/"-spring" suffixes only cover the geometry x Hessian family, and the
+# other six modes disagree among themselves (no-constraints/backbone/xtb-free run
+# AnFreq; quick/quick-ca-fixed/xtb-constrained do not).
+MODE_ANFREQ_DEFAULT = {
+    "caopt-anfreq": True,
+    "quick": False,
+    "quick-ca-fixed": False,
+    "hopt-anfreq": True,
+    "carved-anfreq": True,
+    "no-constraints": True,
+    "backbone": True,
+    "xtb-free": True,
+    "xtb-constrained": False,
+    "carved-spring": False,
+    "hopt-spring": False,
+}
+
+# What [ANFREQ] becomes. The "on" text is byte-for-byte the block the templates
+# carried before, so a generated input for an AnFreq mode is unchanged.
+ANFREQ_ON_TEXT = "# Do frequency calculation (produce .hess file)\n! AnFreq"
+ANFREQ_OFF_TEXT = "# No frequency calculation: this run produces no .hess file"
+
+
+def anfreq_default_for(mode):
+    """Whether *mode* runs analytic frequencies unless told otherwise."""
+    return MODE_ANFREQ_DEFAULT.get(mode, False)
+
+
+def anfreq_directive(enabled):
+    """The text filled into a template's [ANFREQ] placeholder."""
+    return ANFREQ_ON_TEXT if enabled else ANFREQ_OFF_TEXT
+
 
 # Modes whose Hessian comes from xas_pipeline.stages.interp_hessian (interpolated
 # from ligand spring models) rather than from ORCA, which the corvus wrapper runs
@@ -426,8 +474,121 @@ def generate_orca_job_script(
     return generated_job
 
 
-def process_xyz_file(xyz_file, template_dir, output_root, dry_run, template_mode, scheduler):
-    """Process a single XYZ file."""
+# ---------------------------------------------------------------------------
+# ORCA stages
+# ---------------------------------------------------------------------------
+# A "stage" is one ORCA run: a mode (which template) plus whether it runs AnFreq.
+# Normally there is exactly one. With --pre, cheaper stages run first and each
+# subsequent stage starts from the previous stage's *optimized* geometry, chained
+# by a scheduler afterok dependency.
+#
+# Each stage keeps its own run dir under the shared group dir, named for its mode
+# exactly like a stand-alone run:
+#
+#     batch-root/CPA_G_OH_OH/
+#       CPA_G_OH_OH-quick-ca-fixed/     <- stage 1, from <id>_clean.xyz
+#       CPA_G_OH_OH-caopt-anfreq/       <- stage 2, from stage 1's <run_id>.xyz
+#
+# rather than several inputs sharing one dir. That way every existing scan
+# (orca_check, layout.iter_id_dirs, the auto-rerun triage) sees each stage as the
+# ordinary ORCA run it is, needs no changes, and can diagnose or rerun a stage on
+# its own.
+
+
+class StageResult:
+    """What one prepared ORCA stage left on disk, and how to chain to the next."""
+
+    def __init__(self, mode, anfreq, run_id, run_dir, job_script=None, geometry_out=None):
+        self.mode = mode
+        self.anfreq = anfreq
+        self.run_id = run_id
+        self.run_dir = run_dir
+        # None for modes that run no ORCA at all (nothing to submit or chain).
+        self.job_script = job_script
+        # Where ORCA will write this stage's optimized geometry; what the next
+        # stage's *xyzfile points at. It does not exist yet at prepare time --
+        # the afterok dependency is what guarantees it does before stage N+1 runs.
+        self.geometry_out = geometry_out
+        self.job_id = None
+
+
+# Filename of the sidecar one stage leaves behind naming the stage queued after it.
+NEXT_STAGE_FILENAME = "{run_id}-next-stage.json"
+
+
+def next_stage_path(run_dir, run_id):
+    """Path of the "what runs after me" sidecar for an ORCA run directory."""
+    return Path(run_dir) / NEXT_STAGE_FILENAME.format(run_id=run_id)
+
+
+def _record_next_stage(previous, stage, dry_run):
+    """Record, in *previous*'s run dir, which stage was queued afterok on it.
+
+    Only the scheduler knows about the chain, and it forgets the moment a stage
+    fails: the dependent job is killed as DependencyNeverSatisfied. When
+    :mod:`xas_pipeline.cli.rerun_orca` then resubmits the failed stage, this
+    sidecar is what tells it there was a next stage to re-queue onto the new job
+    id -- otherwise a recoverable SCF hiccup in stage 1 silently drops stage 2.
+    """
+    if previous is None:
+        return
+    path = next_stage_path(previous.run_dir, previous.run_id)
+    path.write_text(
+        json.dumps(
+            {
+                "next_run_id": stage.run_id,
+                "next_run_dir": str(stage.run_dir),
+                "next_job_script": stage.job_script.name if stage.job_script else None,
+                "next_job_id": stage.job_id,
+                "dry_run": bool(dry_run),
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    os.chmod(path, 0o644)
+
+
+def plan_stages(final_mode, pre_modes, anfreq_override):
+    """Build the ordered stage list for one invocation.
+
+    ``anfreq_override`` (None / True / False) applies to the FINAL stage only.
+    Intermediate stages never run analytic frequencies: their geometry is about to
+    move again, so the Hessian would describe a structure that is discarded, and
+    AnFreq is by far the most expensive part of these runs.
+    """
+    stages = [(mode, False) for mode in pre_modes]
+    final_anfreq = (
+        anfreq_default_for(final_mode) if anfreq_override is None else anfreq_override
+    )
+    stages.append((final_mode, final_anfreq))
+    return stages
+
+
+def process_xyz_file(
+    xyz_file,
+    template_dir,
+    output_root,
+    dry_run,
+    template_mode,
+    scheduler,
+    *,
+    anfreq=None,
+    geometry_source=None,
+    depend_afterok=None,
+):
+    """Prepare (and unless *dry_run*, submit) one ORCA stage for one XYZ file.
+
+    ``anfreq`` overrides :data:`MODE_ANFREQ_DEFAULT` for this stage; ``None`` uses
+    the mode default. ``geometry_source`` is the geometry the ORCA input should
+    read -- ``None`` means this stage's own cleaned copy of *xyz_file*, and a path
+    means a previous stage's optimized output. ``depend_afterok`` is a list of job
+    ids this stage's submission must wait on.
+
+    Returns a :class:`StageResult` on success and ``None`` on failure (both keep
+    the historical truthiness of the old bool return).
+    """
     # Extract ID from full XYZ stem (no truncation at underscores).
     filename = os.path.basename(xyz_file)
     id_name = Path(filename).stem
@@ -481,7 +642,7 @@ def process_xyz_file(xyz_file, template_dir, output_root, dry_run, template_mode
             f"         Found line 2: {found_line2!r}\n"
             "         No ORCA input or job script was generated for this structure."
         )
-        return False
+        return None
 
     # Modes with no ORCA stage stop here: the run dir is scaffolded (geometry
     # copied, comments extracted, charge/multiplicity validated) but no ORCA input
@@ -506,7 +667,9 @@ def process_xyz_file(xyz_file, template_dir, output_root, dry_run, template_mode
             f"    Mode '{template_mode}' runs no ORCA stage; Hessian will be "
             "interpolated from ligand spring models before CORVUS"
         )
-        return True
+        return StageResult(
+            template_mode, False, output_base, id_dir, geometry_out=geometry_of_record
+        )
 
     # Copy and modify template
     template_file = template_dir / TEMPLATE_FILE_BY_MODE[template_mode]
@@ -514,7 +677,7 @@ def process_xyz_file(xyz_file, template_dir, output_root, dry_run, template_mode
     
     if not template_file.exists():
         print(f"  Error: Template file not found: {template_file}")
-        return False
+        return None
     
     with open(template_file, 'r') as f:
         template_content = f.read()
@@ -536,6 +699,18 @@ def process_xyz_file(xyz_file, template_dir, output_root, dry_run, template_mode
     mem_gb = orca_mem_gb(nprocs_for_mem, maxcore_mb)
     had_maxcore_placeholder = '[MAXCORE]' in template_content
 
+    # AnFreq: the mode default unless this stage was told otherwise.
+    anfreq_enabled = anfreq_default_for(template_mode) if anfreq is None else bool(anfreq)
+
+    # The geometry ORCA reads. Stage 1 reads its own cleaned copy of the input
+    # XYZ; a later stage reads the previous stage's optimized output, which does
+    # not exist yet and is guaranteed to by the afterok dependency. Absolute
+    # either way, because the job script runs ORCA from a scratch directory.
+    if geometry_source is None:
+        geometry_path = id_dir / f"{output_base}_clean.xyz"
+    else:
+        geometry_path = Path(geometry_source).resolve()
+
     # Replace simple placeholders (INDICES / CA_ATOM handled specially below)
     template_content = templates.fill(template_content, {
         "CHARGE": charge,
@@ -543,6 +718,8 @@ def process_xyz_file(xyz_file, template_dir, output_root, dry_run, template_mode
         "PDB_ID": output_base,
         "ID_DIR": id_dir,
         "MAXCORE": maxcore_mb,
+        "ANFREQ": anfreq_directive(anfreq_enabled),
+        "GEOMETRY": geometry_path,
     })
 
     if template_mode in {"xtb-free", "xtb-constrained"}:
@@ -605,6 +782,16 @@ def process_xyz_file(xyz_file, template_dir, output_root, dry_run, template_mode
     os.chmod(output_file, 0o644)
     print(f"  Created input file: {output_file}")
     print(f"    CHARGE={charge}, MULTIPLICITY={multiplicity}")
+    default_anfreq = anfreq_default_for(template_mode)
+    anfreq_note = "" if anfreq_enabled == default_anfreq else " (overridden)"
+    print(f"    AnFreq={'on' if anfreq_enabled else 'off'}{anfreq_note}")
+    if geometry_source is not None:
+        print(f"    Starting geometry: {geometry_path} (previous ORCA stage)")
+    if anfreq_enabled and template_mode in SPRING_HESSIAN_MODES:
+        print(
+            "    Warning: this mode's Hessian is interpolated from ligand spring "
+            "models before CORVUS, so the AnFreq .hess would be overwritten"
+        )
     if had_maxcore_placeholder:
         print(
             f"    Atoms={natoms if natoms is not None else '?'}: "
@@ -653,29 +840,60 @@ def process_xyz_file(xyz_file, template_dir, output_root, dry_run, template_mode
         mem_gb,
     )
     if generated_job is None:
-        return False
+        return None
 
-    submit_command = SCHEDULER_SUBMIT_COMMAND[scheduler]
+    stage = StageResult(
+        template_mode,
+        anfreq_enabled,
+        output_base,
+        id_dir,
+        job_script=generated_job,
+        # ORCA names its outputs after the input stem, so the optimized geometry
+        # lands here and the job script copies it back out of scratch.
+        geometry_out=id_dir / f"{output_base}.xyz",
+    )
+
+    sched = _sched.get_scheduler(scheduler)
+    dep_flag = (
+        sched.dependency_flag("afterok", [str(j) for j in depend_afterok])
+        if depend_afterok
+        else []
+    )
     print(f"  Generated job script: {generated_job.name}")
     if dry_run:
-        print(f"  Dry run: generated {generated_job.name} (submission skipped)")
-    else:
-        submit_cmd = [submit_command, generated_job.name]
-        print(f"  Submitting with {submit_command}...")
-        result = subprocess.run(
-            submit_cmd,
-            cwd=id_dir,
-            capture_output=True,
-            text=True,
-        )
-        if result.stdout:
-            print(f"  submission output:\n{result.stdout}")
-        if result.stderr:
-            print(f"  submission stderr:\n{result.stderr}")
-        if result.returncode != 0:
-            print(f"  Warning: job submission failed (exit code {result.returncode})")
+        dep_note = f" (would depend afterok:{':'.join(map(str, depend_afterok))})" if depend_afterok else ""
+        print(f"  Dry run: generated {generated_job.name} (submission skipped){dep_note}")
+        return stage
 
-    return True
+    submit_cmd = [sched.submit_command, *dep_flag, generated_job.name]
+    if depend_afterok:
+        print(f"  Depends on: afterok:{':'.join(map(str, depend_afterok))}")
+    print(f"  Submitting with {sched.submit_command}...")
+    result = subprocess.run(
+        submit_cmd,
+        cwd=id_dir,
+        capture_output=True,
+        text=True,
+    )
+    if result.stdout:
+        print(f"  submission output:\n{result.stdout}")
+    if result.stderr:
+        print(f"  submission stderr:\n{result.stderr}")
+    if result.returncode != 0:
+        print(f"  Warning: job submission failed (exit code {result.returncode})")
+        # A stage that never reached the queue has no job id for the next stage to
+        # wait on. Reporting failure stops the chain here rather than submitting a
+        # dependent stage that would start from a geometry nothing will write.
+        return None
+
+    try:
+        stage.job_id = sched.parse_job_id(result.stdout)
+    except ValueError as exc:
+        # Submitted, but we cannot name the job. Harmless on its own; main() turns
+        # it into a hard stop only if a further stage needed to depend on it.
+        print(f"  Warning: {exc}")
+
+    return stage
 
 
 def main():
@@ -695,6 +913,33 @@ def main():
     mode_group.add_argument('--xtb-constrained', action='store_true', help='Use orca-template-xtb-constrained.in (COORD=TRUE full QM region with constraints)')
     mode_group.add_argument('--interp', action='store_true', help='Use orca-template-interp-hopt.in (optimize hydrogens only, no AnFreq; the Hessian is interpolated from ligand spring models instead)')
     mode_group.add_argument('--interp-raw', action='store_true', help='No ORCA stage at all: the geometry is used as handed in and the Hessian is interpolated from ligand spring models. Nothing checks the geometry before FEFF does.')
+    parser.add_argument(
+        '--pre',
+        action='append',
+        default=[],
+        metavar='MODE',
+        choices=sorted(TEMPLATE_FILE_BY_MODE),
+        help=(
+            'Run MODE as a cheaper ORCA stage BEFORE the selected mode, chained '
+            'afterok, with the next stage starting from this one\'s optimized '
+            'geometry. Repeatable; stages run in the order given. Each stage gets '
+            'its own <id>-<mode> run dir. Pre-stages never run AnFreq. '
+            'Typical: --pre quick-ca-fixed (B97-3c pre-optimization before the '
+            'default PBE0 caopt-anfreq).'
+        ),
+    )
+    anfreq_group = parser.add_mutually_exclusive_group()
+    anfreq_group.add_argument(
+        '--anfreq', dest='anfreq', action='store_true', default=None,
+        help='Force "! AnFreq" ON for the final stage, whatever its mode default is.',
+    )
+    anfreq_group.add_argument(
+        '--no-anfreq', dest='anfreq', action='store_false', default=None,
+        help=(
+            'Force "! AnFreq" OFF for the final stage: the optimization runs but no '
+            '.hess is produced (so a later CORVUS stage has no ORCA Hessian).'
+        ),
+    )
     parser.add_argument('-n', '--dry-run', action='store_true', help='Generate job script but skip submission')
     parser.add_argument(
         '--scheduler',
@@ -731,7 +976,41 @@ def main():
     elif args.interp_raw:
         template_mode = "asis-spring"
 
-    print(f"Template mode: {template_mode}")
+    # --pre validation. All of these are user errors that would otherwise produce a
+    # chain that cannot run, so fail before anything is written to disk.
+    if args.pre:
+        if template_mode in layout.NO_ORCA_MODES:
+            print(
+                f"ERROR: --pre cannot be combined with mode '{template_mode}', which "
+                "runs no ORCA stage; there would be nothing for the pre-stage to feed."
+            )
+            sys.exit(1)
+        chain = list(args.pre) + [template_mode]
+        duplicates = [m for i, m in enumerate(chain) if m in chain[:i]]
+        if duplicates:
+            print(
+                f"ERROR: mode(s) {sorted(set(duplicates))} appear more than once in the "
+                f"stage chain {' -> '.join(chain)}. Each stage needs its own <id>-<mode> "
+                "run dir, so a mode can only appear once."
+            )
+            sys.exit(1)
+
+    stages = plan_stages(template_mode, args.pre, args.anfreq)
+
+    if len(stages) > 1:
+        print(
+            "Stage chain: "
+            + " -> ".join(
+                f"{mode}({'AnFreq' if af else 'no AnFreq'})" for mode, af in stages
+            )
+        )
+        print("  Each stage starts from the previous stage's optimized geometry (afterok).")
+        print("  Pre-stages never run AnFreq; --anfreq/--no-anfreq applies to the final stage.")
+    else:
+        print(f"Template mode: {template_mode}")
+        mode, final_anfreq = stages[0]
+        if args.anfreq is not None:
+            print(f"AnFreq: {'on' if final_anfreq else 'off'} (overriding the {mode} default)")
     print(f"Scheduler: {args.scheduler}")
     
     # Templates ship as package data (orca-templates/, {slurm,pbs}-scripts/).
@@ -803,16 +1082,41 @@ def main():
     
     failed_files = []
     for xyz_file in xyz_files:
-        ok = process_xyz_file(
-            xyz_file,
-            template_dir,
-            output_root,
-            args.dry_run,
-            template_mode,
-            args.scheduler,
-        )
-        if not ok:
-            failed_files.append(xyz_file)
+        previous = None
+        for index, (mode, stage_anfreq) in enumerate(stages):
+            stage = process_xyz_file(
+                xyz_file,
+                template_dir,
+                output_root,
+                args.dry_run,
+                mode,
+                args.scheduler,
+                anfreq=stage_anfreq,
+                # Stage 1 starts from the input XYZ; every later stage starts from
+                # the geometry the stage before it will have optimized.
+                geometry_source=None if previous is None else previous.geometry_out,
+                depend_afterok=(
+                    [previous.job_id]
+                    if previous is not None and previous.job_id is not None
+                    else None
+                ),
+            )
+            if stage is None:
+                failed_files.append(xyz_file)
+                break
+            if index + 1 < len(stages) and not args.dry_run and stage.job_id is None:
+                # Without the parent's job id the next stage would be submitted with
+                # no dependency and would read a geometry file that does not exist
+                # yet. Stop the chain and report it rather than queue a doomed job.
+                print(
+                    f"  ERROR: stage '{mode}' has no scheduler job id, so the "
+                    f"remaining stage(s) cannot be chained onto it. Submit them by "
+                    f"hand once {stage.run_id} finishes."
+                )
+                failed_files.append(xyz_file)
+                break
+            _record_next_stage(previous, stage, args.dry_run)
+            previous = stage
 
     if failed_files:
         print(

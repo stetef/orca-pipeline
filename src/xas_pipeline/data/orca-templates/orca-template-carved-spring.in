@@ -1,13 +1,17 @@
 ! PBE0 D3BJ RIJCOSX def2-TZVP def2/J CPCM(water)
 
-# Single point for the energy ONLY -- deliberately no "! AnFreq".
+# Single point for the energy ONLY -- no analytic frequencies.
 # The Hessian this run would otherwise produce is instead interpolated from the
 # packaged ligand spring models by xas_pipeline.stages.interp_hessian, which the
 # corvus wrapper runs before prepare-corvus and which writes the same
-# <run_id>.hess the CORVUS/FEFF stage expects. Adding "! AnFreq" back here would
-# not break anything, but it would spend the analytic-frequency time that this
-# mode exists to avoid, and its .hess would then be overwritten by the
-# interpolated one.
+# <run_id>.hess the CORVUS/FEFF stage expects.
+#
+# [ANFREQ] below is filled by prepare-orca and defaults to OFF for this mode
+# (MODE_ANFREQ_DEFAULT). Forcing it on with --anfreq would not break anything,
+# but it would spend the analytic-frequency time that this mode exists to avoid,
+# and its .hess would then be overwritten by the interpolated one.
+
+[ANFREQ]
 
 ! 6-311++G(d,p)
 ! ZORA ZORA-def2-TZVP SARC/J
@@ -24,4 +28,4 @@ end
   end
 
 # Use xyz file, first number is charge, second number is multiplicity (2S+1)
-*xyzfile [CHARGE] [MULTIPLICITY] [ID_DIR]/[PDB_ID]_clean.xyz
+*xyzfile [CHARGE] [MULTIPLICITY] [GEOMETRY]

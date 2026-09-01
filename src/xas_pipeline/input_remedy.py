@@ -11,8 +11,9 @@ returns the edited input for the resubmission:
   ``*xyzfile`` geometry line, behind a ``# --- auto-rerun remedy: <label> ---``
   marker;
 * ``%maxcore N`` multiplied by ``maxcore_mult`` (rounded);
-* on ``opt_restart``, the geometry filename on the ``*xyzfile`` line is swapped
-  for the last-completed geometry.
+* on ``opt_restart``, the geometry on the ``*xyzfile`` line is swapped for the
+  last-completed geometry (a full path replaces the whole spec; a bare filename
+  keeps the directory already on the line).
 """
 
 from __future__ import annotations
@@ -22,20 +23,29 @@ from xas_pipeline.remedy import Remedy
 REMEDY_MARKER = "# --- auto-rerun remedy:"
 
 
-def _swap_geometry_filename(xyzfile_line: str, new_filename: str) -> str:
+def _swap_geometry_filename(xyzfile_line: str, new_geometry: str) -> str:
     """Replace the geometry file on a ``*xyzfile <charge> <mult> <path>`` line.
 
-    Only the basename is swapped; the directory (if any) is preserved.
+    A ``new_geometry`` containing a ``/`` is used verbatim; a bare filename is
+    resolved against the directory already on the line (if any).
+
+    Both forms matter. Historically the line always pointed inside the run dir, so
+    swapping the basename was enough. With a staged run (``prepare-orca --pre``)
+    stage 2's line points at *stage 1's* directory, and keeping that directory
+    while swapping in stage 2's ``<run_id>.xyz`` would name a file that does not
+    exist -- so the caller passes the full path instead.
     """
     parts = xyzfile_line.split()
     if len(parts) < 2:
         return xyzfile_line
     old_path = parts[-1]
-    if "/" in old_path:
+    if "/" in new_geometry:
+        parts[-1] = new_geometry
+    elif "/" in old_path:
         directory = old_path.rsplit("/", 1)[0]
-        parts[-1] = f"{directory}/{new_filename}"
+        parts[-1] = f"{directory}/{new_geometry}"
     else:
-        parts[-1] = new_filename
+        parts[-1] = new_geometry
     return " ".join(parts)
 
 
